@@ -1,0 +1,477 @@
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import math
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from axor_sentinel.graph.model import SignalType
+from axor_sentinel.graph import queries as q
+from axor_sentinel.sentinel.events import (
+    AgentContainerBaseline,
+    FanoutSignal,
+    ReputationEvent,
+)
+from axor_sentinel.sentinel.snapshot import (
+    ReputationSnapshot,
+    atomic_swap,
+    validate_snapshot_dir,
+)
+from axor_sentinel.sentinel.weight import (
+    FLAG_THRESHOLD,
+    accumulate,
+    compute_effective_weight,
+    compute_hot_weight,
+    compute_container_score,
+    origin_dampening,
+    source_diversity_factor,
+)
+
+log = logging.getLogger("axor.sentinel.cycle")
+
+# Fanout detection parameters
+FANOUT_Z_THRESHOLD: float = 2.5
+FANOUT_MIN_SESSIONS: int = 10       # cold-start guard (invariant A-14)
+FANOUT_MIN_DELTA: int = 3           # absolute minimum above mean for low-std agents
+BASELINE_WINDOW_SESSIONS: int = 50  # sessions used to recompute baseline
+FANOUT_WEIGHT: float = 0.5          # flat weight added to all touched resources (A-10)
+
+# Signal type that determines minimum threshold for fanout trigger (A-15)
+_FANOUT_MIN_SIGNAL = SignalType.READ_SUMMARIZE
+
+
+@dataclass
+class ResourceAccess:
+    """
+    A single resource access within a session, as fed to SentinelCycle.
+
+    Strongly typed runtime record: ``canonical_confidence`` from the normalizer,
+    ``signal_type`` as the ``SignalType`` enum. Compare with
+    ``bench.dataset.schema.AccessEvent`` — the bench's thin serialisation DTO
+    (plain string signal_type, no canonical_confidence).
+    """
+    resource_id: str
+    container_id: str
+    canonical_confidence: float
+    signal_type: SignalType   # graded involvement depth
+
+
+@dataclass
+class SessionSummary:
+    """Lightweight session record pulled from axor-core DecisionTrace."""
+    session_id: str
+    agent_id: str
+    started_at: float
+    had_taint: bool
+    had_export_attempt: bool
+    had_failed_export: bool
+    had_escalation: bool
+    accessed_resources: list[ResourceAccess] = field(default_factory=list)
+    taint_source: str = "unknown_external"   # TaintSource.value
+
+
+class SentinelCycle:
+    """
+    Background audit cycle — pulls session traces, updates graph, writes snapshot.
+
+    Not in the hot path. Runs every AUDIT_INTERVAL (default: 1 hour).
+
+    Audit cycle order (per spec):
+      1. Apply time decay to all resources (against last_decay_at)
+      2. Per tainted session:
+         a. Determine signal_type per accessed resource
+         b. Check for fanout → emit FanoutSignal if triggered
+         c. Apply hot weights + ReputationEvent per resource
+         d. Apply caution weights to adjacent resources
+         e. flagged updated on every score change (A-2)
+         f. Recompute container scores for affected containers
+      3. Atomically swap reputation snapshot
+      4. Notify axor-core of new snapshot version
+    """
+
+    def __init__(
+        self,
+        neo4j_session: Any,
+        snapshot_dir: Path,
+        agent_baselines: dict[str, AgentContainerBaseline] | None = None,
+        signal_history: dict[str, list[str]] | None = None,
+        prior_counts: dict[tuple[str, str], int] | None = None,
+    ) -> None:
+        """
+        Args:
+            neo4j_session:    live neo4j.Session for graph operations
+            snapshot_dir:     directory for atomic snapshot writes
+            agent_baselines:  agent_id → AgentContainerBaseline (updated in-place)
+            signal_history:   resource_id → list[taint_source] (for diversity factor)
+            prior_counts:     (resource_id, taint_source) → count (for dampening)
+        """
+        self._neo4j = neo4j_session
+        self._snapshot_dir = Path(snapshot_dir)
+        self._reputation_events: list[ReputationEvent] = []
+        self._fanout_signals: list[FanoutSignal] = []
+
+        # In-memory resource scores (updated during a cycle, then snapshot-written)
+        self._resource_scores: dict[str, float] = {}
+        self._container_member_map: dict[str, list[str]] = {}  # container_id → [resource_ids]
+
+        # If explicit state is provided (tests / controlled init), use it directly.
+        # Otherwise try to restore persisted state from disk so poisoning-mitigation
+        # counters and agent baselines survive process restarts.
+        if agent_baselines is not None or signal_history is not None or prior_counts is not None:
+            self._baselines: dict[str, AgentContainerBaseline] = agent_baselines or {}
+            self._signal_history: dict[str, list[str]] = signal_history or {}
+            self._prior_counts: dict[tuple[str, str], int] = prior_counts or {}
+            self._current_version: int = 0
+        else:
+            sh, pc, bl, ver = SentinelCycle.load_state(
+                self._snapshot_dir / "sentinel_state.json"
+            )
+            self._baselines = bl
+            self._signal_history = sh
+            self._prior_counts = pc
+            self._current_version = ver
+            if ver > 0:
+                log.info("sentinel: restored persisted state version=%d", ver)
+
+        # Warn early if snapshot_dir is a network mount (invariant A-17).
+        # Done in __init__ so operators learn about the misconfiguration at startup,
+        # not at the first write hours later.
+        validate_snapshot_dir(self._snapshot_dir)
+
+    def run_once(
+        self,
+        sessions: list[SessionSummary],
+        resource_scores: dict[str, float] | None = None,
+        container_members: dict[str, list[str]] | None = None,
+    ) -> ReputationSnapshot:
+        """
+        Execute one audit cycle.
+
+        Args:
+            sessions:          completed sessions since last audit
+            resource_scores:   current resource_id → score (mutated in-place)
+            container_members: container_id → [resource_ids] for aggregation
+
+        Returns:
+            The newly written ReputationSnapshot.
+        """
+        now = time.time()
+        scores = dict(resource_scores) if resource_scores else {}
+        cmembers = dict(container_members) if container_members else {}
+
+        # Step 1 — apply time decay first (invariant A-4).
+        # Decay is authoritative in Neo4j (correct last_decay_at per resource).
+        # resource_scores passed by caller should be current Neo4j-authoritative values;
+        # no additional in-memory decay is applied here to avoid A-3 violations.
+        q.apply_decay(self._neo4j, flag_threshold=FLAG_THRESHOLD)
+
+        self._reputation_events.clear()
+        self._fanout_signals.clear()
+
+        # Step 2 — process each tainted session
+        for session in sessions:
+            if not session.had_taint:
+                continue
+
+            # 2b — fanout detection
+            fanout = self._check_fanout(session, now)
+            if fanout is not None:
+                self._fanout_signals.append(fanout)
+
+            # 2c — apply hot weights per accessed resource
+            for access in session.accessed_resources:
+                rid = access.resource_id
+                raw_weight = compute_hot_weight(access.signal_type)
+                history = self._signal_history.get(rid, [])
+                prior = self._prior_counts.get((rid, session.taint_source), 0)
+                eff_weight = compute_effective_weight(
+                    raw_weight=raw_weight,
+                    canonical_confidence=access.canonical_confidence,
+                    signal_history=history,
+                    current_source=session.taint_source,
+                    prior_count_from_source=prior,
+                )
+
+                score_before = scores.get(rid, 0.0)
+                score_after = accumulate(score_before, eff_weight)
+
+                # A-10: fanout flat 0.5 applied as a SEPARATE accumulate call
+                if fanout is not None and rid in fanout.affected_resources:
+                    score_after = accumulate(score_after, FANOUT_WEIGHT)
+
+                scores[rid] = score_after
+
+                # Apply to Neo4j.
+                # The Cypher query multiplies $raw_weight by r.canonical_confidence,
+                # so we pass a pre-scaled weight = raw_weight * diversity * dampening
+                # (everything except canonical_confidence) so the query result matches
+                # the in-memory effective_weight (invariant A-8).
+                div_f = source_diversity_factor(history, session.taint_source)
+                damp_f = origin_dampening(prior)
+                neo4j_raw = raw_weight * div_f * damp_f  # Cypher will multiply by canonical_confidence
+                q.apply_hot_weight(
+                    self._neo4j,
+                    session_id=session.session_id,
+                    signal_type=access.signal_type.value,
+                    raw_weight=neo4j_raw,
+                    flag_threshold=FLAG_THRESHOLD,
+                )
+
+                # Record evidence
+                event = ReputationEvent.create(
+                    resource_id=rid,
+                    session_id=session.session_id,
+                    taint_source=session.taint_source,
+                    signal_type=access.signal_type.value,
+                    raw_weight=raw_weight,
+                    effective_weight=eff_weight,
+                    score_before=score_before,
+                    score_after=score_after,
+                    reason=(
+                        f"hot signal {access.signal_type.value} "
+                        f"from tainted session {session.session_id}"
+                    ),
+                    timestamp=now,
+                )
+                self._reputation_events.append(event)
+
+                # Update signal history and prior counts
+                self._signal_history.setdefault(rid, []).append(session.taint_source)
+                key = (rid, session.taint_source)
+                self._prior_counts[key] = self._prior_counts.get(key, 0) + 1
+
+            # 2d(fanout) — write fanout flat weight to Neo4j (invariant A-10).
+            # The in-memory scores already include the fanout boost (applied above).
+            # This call keeps the graph in sync so the next cycle reads correct values.
+            if fanout is not None:
+                q.apply_fanout_weight(
+                    self._neo4j,
+                    resource_ids=fanout.affected_resources,
+                    fanout_weight=FANOUT_WEIGHT,
+                    flag_threshold=FLAG_THRESHOLD,
+                )
+
+            # 2e — caution weights to adjacent resources
+            q.apply_caution_adjacent(
+                self._neo4j,
+                session_id=session.session_id,
+                flag_threshold=FLAG_THRESHOLD,
+            )
+
+        # 2f — recompute container scores
+        container_scores: dict[str, float] = {}
+        for cid, member_ids in cmembers.items():
+            member_scores = [scores.get(rid, 0.0) for rid in member_ids]
+            container_scores[cid] = compute_container_score(member_scores)
+
+        # Step 3 — atomically write new snapshot (invariant A-5)
+        self._current_version += 1
+        snapshot = ReputationSnapshot(
+            version=self._current_version,
+            generated_at=now,
+            resource_reputation=scores,
+            container_reputation=container_scores,
+        ).with_checksum()
+        atomic_swap(self._snapshot_dir, snapshot)
+
+        log.info(
+            "sentinel cycle complete: version=%d resources=%d containers=%d events=%d",
+            self._current_version,
+            len(scores),
+            len(container_scores),
+            len(self._reputation_events),
+        )
+
+        # Persist state so poisoning-mitigation counters and baselines survive restarts.
+        self.save_state()
+
+        return snapshot
+
+    # ── Fanout detection ───────────────────────────────────────────────────────
+
+    def _check_fanout(
+        self,
+        session: SessionSummary,
+        now: float,
+    ) -> FanoutSignal | None:
+        """
+        Check whether the session's container access pattern exceeds the agent's
+        historical baseline by FANOUT_Z_THRESHOLD standard deviations.
+
+        All three conditions must be true (invariant A-15):
+          1. session.had_taint
+          2. z_score > FANOUT_Z_THRESHOLD
+          3. max signal_type >= READ_SUMMARIZE
+        Cold start: returns None if baseline.session_count < FANOUT_MIN_SESSIONS (A-14).
+        """
+        # Invariant A-15: had_taint is required for fanout detection
+        if not session.had_taint:
+            return None
+
+        baseline = self._baselines.get(session.agent_id)
+        # Cold-start guard (invariant A-14)
+        if baseline is None or baseline.session_count < FANOUT_MIN_SESSIONS:
+            return None
+
+        # Determine unique containers touched
+        containers = {a.container_id for a in session.accessed_resources}
+        unique_containers = len(containers)
+
+        # Signal type gate (invariant A-15): need at least READ_SUMMARIZE.
+        # max() uses SignalType.__gt__ which compares by explicit _rank — safe
+        # against enum reordering.
+        signal_values = [a.signal_type for a in session.accessed_resources]
+        if not signal_values:
+            return None
+        max_signal = max(signal_values)
+        if max_signal < _FANOUT_MIN_SIGNAL:
+            return None
+
+        # z-score calculation
+        std = baseline.std_containers_per_session
+        mean = baseline.mean_containers_per_session
+
+        # Low-std guard: require absolute delta > FANOUT_MIN_DELTA
+        if std < 0.01:
+            if unique_containers <= mean + FANOUT_MIN_DELTA:
+                return None
+            z_score = float("inf")
+        else:
+            z_score = (unique_containers - mean) / std
+
+        if z_score <= FANOUT_Z_THRESHOLD:
+            return None
+
+        affected = [a.resource_id for a in session.accessed_resources]
+        return FanoutSignal(
+            origin_session_id=session.session_id,
+            agent_id=session.agent_id,
+            taint_source=session.taint_source,
+            affected_resources=affected,
+            unique_containers=unique_containers,
+            baseline_mean=mean,
+            z_score=z_score,
+            window_minutes=0.0,
+        )
+
+    # ── State persistence ──────────────────────────────────────────────────────
+
+    def save_state(self) -> None:
+        """
+        Persist signal_history, prior_counts, and baselines to disk.
+
+        Written to ``sentinel_state.json`` in snapshot_dir.  Called automatically
+        at the end of every ``run_once()`` so poisoning-mitigation counters and
+        agent baselines survive process restarts.
+
+        Failures are logged and swallowed — a missing state file is recoverable
+        (cold-start behaviour); a crash during save must not abort the cycle.
+        """
+        try:
+            self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+            state: dict = {
+                "version": self._current_version,
+                "signal_history": self._signal_history,
+                # tuple keys are not JSON-serialisable — encode as "rid\x00src"
+                "prior_counts": {
+                    f"{rid}\x00{src}": count
+                    for (rid, src), count in self._prior_counts.items()
+                },
+                "baselines": {
+                    aid: dataclasses.asdict(b)
+                    for aid, b in self._baselines.items()
+                },
+            }
+            state_file = self._snapshot_dir / "sentinel_state.json"
+            state_file.write_text(
+                json.dumps(state, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            log.debug("sentinel state saved: version=%d", self._current_version)
+        except Exception as exc:  # pragma: no cover
+            log.warning("sentinel: failed to save state: %s", exc)
+
+    @staticmethod
+    def load_state(
+        state_path: Path,
+    ) -> tuple[
+        dict[str, list[str]],
+        dict[tuple[str, str], int],
+        dict[str, AgentContainerBaseline],
+        int,
+    ]:
+        """
+        Load persisted sentinel state from ``state_path``.
+
+        Returns ``(signal_history, prior_counts, baselines, version)``.
+        Returns empty dicts and version=0 if the file does not exist or is corrupt.
+        """
+        if not state_path.exists():
+            return {}, {}, {}, 0
+        try:
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            log.warning("sentinel: failed to load state from %s: %s", state_path, exc)
+            return {}, {}, {}, 0
+
+        signal_history: dict[str, list[str]] = raw.get("signal_history", {})
+
+        prior_counts: dict[tuple[str, str], int] = {}
+        for key, count in raw.get("prior_counts", {}).items():
+            rid, sep, src = key.partition("\x00")
+            if sep:
+                prior_counts[(rid, src)] = int(count)
+
+        baselines: dict[str, AgentContainerBaseline] = {}
+        for aid, bdata in raw.get("baselines", {}).items():
+            try:
+                baselines[aid] = AgentContainerBaseline(**bdata)
+            except TypeError:
+                pass  # schema mismatch after upgrade — skip stale entry
+
+        version = int(raw.get("version", 0))
+        return signal_history, prior_counts, baselines, version
+
+    def update_baseline(
+        self,
+        agent_id: str,
+        recent_sessions: list[SessionSummary],
+    ) -> None:
+        """
+        Recompute AgentContainerBaseline from the last BASELINE_WINDOW_SESSIONS sessions.
+
+        Called after each completed session. Exponential smoothing prevents a single
+        anomalous session from sharply shifting the baseline.
+        """
+        if len(recent_sessions) < 2:
+            return
+        window = recent_sessions[-BASELINE_WINDOW_SESSIONS:]
+        counts = [
+            len({a.container_id for a in s.accessed_resources})
+            for s in window
+        ]
+        n = len(counts)
+        mean = sum(counts) / n
+        # Sample variance (Bessel's correction: divide by n-1) gives an unbiased
+        # std estimate.  max(n-1, 1) avoids ZeroDivisionError when n=1.
+        variance = sum((c - mean) ** 2 for c in counts) / max(n - 1, 1)
+        std = math.sqrt(variance) if variance > 0 else 0.0
+
+        existing = self._baselines.get(agent_id)
+        if existing is not None:
+            # Exponential smoothing: blend new stats with existing baseline
+            alpha = 0.3
+            mean = alpha * mean + (1 - alpha) * existing.mean_containers_per_session
+            std = alpha * std + (1 - alpha) * existing.std_containers_per_session
+
+        self._baselines[agent_id] = AgentContainerBaseline(
+            agent_id=agent_id,
+            mean_containers_per_session=mean,
+            std_containers_per_session=std,
+            session_count=n,
+            last_updated=time.time(),
+        )

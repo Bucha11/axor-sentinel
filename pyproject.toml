@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "axor-sentinel"
+version = "0.1.0"
+description = "Cross-session behavioral analysis for Axor via weighted resource reputation graph"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["agents", "governance", "security", "reputation", "ai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Base package has no required deps — axor-core is a peer, not a hard dep.
+# Install with pip install "axor-sentinel[neo4j]" to enable graph backend.
+dependencies = []
+
+[project.optional-dependencies]
+neo4j = ["neo4j>=5"]
+bench = []   # bench uses only stdlib and the axor-sentinel base package
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Repository = "https://github.com/Bucha11/axor-sentinel"
+
+[tool.hatch.build.targets.wheel]
+packages = ["axor_sentinel"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["axor_sentinel"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+]

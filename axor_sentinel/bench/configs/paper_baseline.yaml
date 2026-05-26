@@ -1,0 +1,29 @@
+# Paper-baseline dataset composition (spec §Dataset composition)
+# Total: 820 scenarios — 420 attack, 400 benign
+# Seed: 42 (deterministic across runs)
+
+seed: 42
+
+# ── Attack scenarios ──────────────────────────────────────────
+# slow_and_low: 270 total (3 variants × 90)
+slow_and_low_2: 90
+slow_and_low_4: 90
+slow_and_low_8: 90
+
+# fanout: 90 total (3 variants × 30)
+fanout_3: 30
+fanout_5: 30
+fanout_10: 30
+
+# distributed staging: 60
+distributed_staging: 60
+
+# ── Benign scenarios ──────────────────────────────────────────
+# narrow: 150
+benign_narrow: 150
+
+# broad/etl (split equally): 150 total
+benign_broad_etl: 150
+
+# false-taint (most important benign variant per spec): 100
+benign_false_taint: 100
