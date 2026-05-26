@@ -74,7 +74,7 @@ jobs:
           EOF
 
       - name: Lint
-        run: ruff check . --quiet
+        run: ruff check axor_sentinel/ tests/ bench_run.py --quiet
 
       - name: Type check
         run: mypy axor_sentinel/
