@@ -30,6 +30,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      - name: Checkout axor-core
+        if: github.event_name != 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/axor-core
+          path: axor-core
+
+      - name: Install axor-core from source
+        if: github.event_name != 'repository_dispatch'
+        run: pip install -e axor-core/
+
       - name: Install axor-core from PyPI (pinned to triggering version)
         if: github.event_name == 'repository_dispatch'
         run: |
