@@ -102,6 +102,16 @@ def _normalize_path(raw: str) -> str:
     except Exception:
         resolved = raw
 
+    # Resolve symlinks for absolute local paths so the same on-disk resource
+    # cannot be aliased to a different canonical ID via a symlink (M-1). Only
+    # absolute paths are realpath-resolved — relative paths must not be joined
+    # against the current working directory (that would be non-deterministic).
+    if os.path.isabs(resolved):
+        try:
+            resolved = os.path.realpath(resolved).replace("\\", "/")
+        except OSError:
+            pass
+
     # Lowercase and strip trailing slash (except root)
     resolved = resolved.lower()
     if len(resolved) > 1:

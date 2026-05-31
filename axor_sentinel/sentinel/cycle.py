@@ -19,7 +19,9 @@ from axor_sentinel.sentinel.events import (
 from axor_sentinel.sentinel.snapshot import (
     ReputationSnapshot,
     atomic_swap,
+    sign_blob,
     validate_snapshot_dir,
+    verify_blob,
 )
 from axor_sentinel.sentinel.weight import (
     FLAG_THRESHOLD,
@@ -387,10 +389,19 @@ class SentinelCycle:
                 },
             }
             state_file = self._snapshot_dir / "sentinel_state.json"
-            state_file.write_text(
-                json.dumps(state, sort_keys=True, separators=(",", ":")),
-                encoding="utf-8",
-            )
+            serialized = json.dumps(state, sort_keys=True, separators=(",", ":"))
+            # Authenticate state when a key is configured: poisoned baselines /
+            # prior_counts / signal_history would silently corrupt fanout and
+            # dampening after restart.
+            sig = sign_blob(serialized)
+            if sig is not None:
+                out = json.dumps(
+                    {"_signed": True, "payload": serialized, "sig": sig},
+                    separators=(",", ":"),
+                )
+            else:
+                out = serialized
+            state_file.write_text(out, encoding="utf-8")
             log.debug("sentinel state saved: version=%d", self._current_version)
         except Exception as exc:  # pragma: no cover
             log.warning("sentinel: failed to save state: %s", exc)
@@ -413,10 +424,32 @@ class SentinelCycle:
         if not state_path.exists():
             return {}, {}, {}, 0
         try:
-            raw = json.loads(state_path.read_text(encoding="utf-8"))
+            text = state_path.read_text(encoding="utf-8")
+            obj = json.loads(text)
         except Exception as exc:
             log.warning("sentinel: failed to load state from %s: %s", state_path, exc)
             return {}, {}, {}, 0
+
+        # Authenticate before trusting. Signed envelope → verify HMAC; legacy
+        # flat state → accept only when no key/signature is required (else cold
+        # start). A failed check resets to baseline rather than loading poisoned
+        # counters.
+        if isinstance(obj, dict) and obj.get("_signed"):
+            serialized = obj.get("payload", "")
+            if not verify_blob(serialized, obj.get("sig")):
+                log.warning("sentinel: state signature invalid — cold start")
+                return {}, {}, {}, 0
+            try:
+                raw = json.loads(serialized)
+            except Exception:
+                return {}, {}, {}, 0
+        else:
+            if not verify_blob(text, None):
+                log.warning(
+                    "sentinel: unsigned state rejected (key/signature required) — cold start"
+                )
+                return {}, {}, {}, 0
+            raw = obj
 
         signal_history: dict[str, list[str]] = raw.get("signal_history", {})
 

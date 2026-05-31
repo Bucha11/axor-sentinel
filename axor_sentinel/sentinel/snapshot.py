@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -14,9 +15,64 @@ log = logging.getLogger("axor.sentinel.snapshot")
 # Number of old snapshot version files to keep alongside the current symlink.
 SNAPSHOT_RETAIN_VERSIONS: int = 3
 
+# Env var holding the HMAC key used to authenticate snapshots. When set, the
+# checksum alone is no longer trusted — a valid HMAC signature is required on
+# load. The key must live outside the snapshot directory and be unreachable by
+# the governed agent. When unset, behaviour falls back to checksum-only
+# integrity (corruption detection, NOT tamper protection).
+SNAPSHOT_KEY_ENV: str = "AXOR_SNAPSHOT_KEY"
+
+
+def _snapshot_key() -> bytes | None:
+    raw = os.environ.get(SNAPSHOT_KEY_ENV, "")
+    return raw.encode() if raw else None
+
+
+def _signature_required() -> bool:
+    """True when an authenticated signature is mandatory to load a snapshot.
+
+    Enabled explicitly via AXOR_SNAPSHOT_REQUIRE_SIGNATURE, or implicitly when
+    running in a production environment (AXOR_ENV=production). In that mode an
+    unsigned snapshot — or any snapshot when no key is configured — is refused
+    (fail-closed): the reputation gate must not run on unauthenticated data.
+    """
+    if os.environ.get("AXOR_SNAPSHOT_REQUIRE_SIGNATURE", "").lower() in ("1", "true", "yes"):
+        return True
+    return os.environ.get("AXOR_ENV", "").lower() == "production"
+
+
+def sign_blob(serialized: str) -> str | None:
+    """HMAC-sign an arbitrary serialized blob with the snapshot key.
+
+    Returns the hex signature, or None when no key is configured. Reused for any
+    locally-persisted state that must be tamper-evident (e.g. sentinel_state.json).
+    """
+    key = _snapshot_key()
+    if key is None:
+        return None
+    return hmac.new(key, serialized.encode(), hashlib.sha256).hexdigest()
+
+
+def verify_blob(serialized: str, signature: str | None) -> bool:
+    """Return True if a persisted blob is safe to load.
+
+    - key configured  → require a matching HMAC signature.
+    - no key, prod / require-signature → refuse (fail-closed).
+    - no key, otherwise → accept (integrity not enforced).
+    """
+    key = _snapshot_key()
+    if key is not None:
+        if not signature:
+            return False
+        expected = hmac.new(key, serialized.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected)
+    if _signature_required():
+        return False
+    return True
+
 
 class AuditIntegrityWarning(UserWarning):
-    """Emitted when snapshot checksum verification fails."""
+    """Emitted when snapshot checksum or signature verification fails."""
 
 
 @dataclass(frozen=True)
@@ -35,10 +91,10 @@ class ReputationSnapshot:
     resource_reputation: dict[str, float] = field(default_factory=dict)
     container_reputation: dict[str, float] = field(default_factory=dict)
     checksum: str = ""
+    signature: str = ""
 
-    def compute_checksum(self) -> str:
-        """SHA-256 of the reputation maps, deterministically serialized."""
-        payload = json.dumps(
+    def _canonical_payload(self) -> bytes:
+        return json.dumps(
             {
                 "resource_reputation": self.resource_reputation,
                 "container_reputation": self.container_reputation,
@@ -46,11 +102,22 @@ class ReputationSnapshot:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        return hashlib.sha256(payload).hexdigest()
+
+    def compute_checksum(self) -> str:
+        """SHA-256 of the reputation maps, deterministically serialized."""
+        return hashlib.sha256(self._canonical_payload()).hexdigest()
+
+    def compute_signature(self, key: bytes) -> str:
+        """HMAC-SHA256 of the reputation maps under the given key."""
+        return hmac.new(key, self._canonical_payload(), hashlib.sha256).hexdigest()
 
     def with_checksum(self) -> "ReputationSnapshot":
-        """Return a copy of this snapshot with the checksum field populated."""
-        return replace(self, checksum=self.compute_checksum())
+        """Return a copy with checksum populated, and signature if a key is set."""
+        updated = replace(self, checksum=self.compute_checksum())
+        key = _snapshot_key()
+        if key is not None:
+            updated = replace(updated, signature=updated.compute_signature(key))
+        return updated
 
 
 def _serialize(snapshot: ReputationSnapshot) -> str:
@@ -78,6 +145,14 @@ def atomic_swap(snapshot_dir: Path, new_snapshot: ReputationSnapshot) -> None:
     """
     snapshot_dir = Path(snapshot_dir)
     snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    # Attach an HMAC signature if a key is configured and one is not already set,
+    # so snapshots written by this process are tamper-evident on load (M-2).
+    key = _snapshot_key()
+    if key is not None and not new_snapshot.signature:
+        new_snapshot = replace(
+            new_snapshot, signature=new_snapshot.compute_signature(key)
+        )
 
     version_file = snapshot_dir / f"snapshot_v{new_snapshot.version}.json"
     serialized = _serialize(new_snapshot)
@@ -126,10 +201,38 @@ def load_snapshot(snapshot_dir: Path) -> ReputationSnapshot | None:
         text = current_link.read_text(encoding="utf-8")
         snapshot = _deserialize(text)
         expected = snapshot.compute_checksum()
-        if snapshot.checksum != expected:
+        if not hmac.compare_digest(snapshot.checksum, expected):
             warnings.warn(
                 f"snapshot checksum mismatch: stored={snapshot.checksum!r} "
                 f"computed={expected!r} — retaining previous snapshot",
+                AuditIntegrityWarning,
+                stacklevel=2,
+            )
+            return None
+        # Authenticate the snapshot when a key is configured. A correct checksum
+        # is not sufficient — an attacker with write access can recompute it.
+        key = _snapshot_key()
+        if key is not None:
+            expected_sig = snapshot.compute_signature(key)
+            if not snapshot.signature or not hmac.compare_digest(
+                snapshot.signature, expected_sig
+            ):
+                warnings.warn(
+                    "snapshot signature invalid or missing while "
+                    f"{SNAPSHOT_KEY_ENV} is set — refusing to load (possible "
+                    "tampering); retaining previous snapshot",
+                    AuditIntegrityWarning,
+                    stacklevel=2,
+                )
+                return None
+        elif _signature_required():
+            # Production requires authenticated snapshots but no key is configured,
+            # so the signature cannot be verified — fail closed.
+            warnings.warn(
+                "snapshot signature is required (production / "
+                "AXOR_SNAPSHOT_REQUIRE_SIGNATURE) but no "
+                f"{SNAPSHOT_KEY_ENV} is configured — refusing to load; "
+                "retaining previous snapshot",
                 AuditIntegrityWarning,
                 stacklevel=2,
             )
