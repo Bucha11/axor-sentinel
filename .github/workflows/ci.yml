@@ -63,9 +63,10 @@ jobs:
                   path = os.path.join(root, f)
                   src  = open(path).read()
                   if "import axor_core" in src or "from axor_core" in src:
-                      # Only integration/ and tests/ are allowed to import axor_core
+                      # Only integration/, tests/, and the version-compat shim
+                      # may import axor_core.
                       rel = os.path.relpath(path, "axor_sentinel")
-                      if not (rel.startswith("integration") or rel.startswith("../tests")):
+                      if not (rel.startswith("integration") or rel.startswith("../tests") or rel == "compatibility.py"):
                           issues.append(f"DEPENDENCY_VIOLATION: {path} imports axor_core outside integration/")
           if issues:
               print("\n".join(issues))

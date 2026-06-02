@@ -53,3 +53,11 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "@abstractmethod",
 ]
+
+[tool.mypy]
+# axor-core is a peer dependency referenced only for type-checking (P-34). It may
+# ship without stubs, and newer contracts (e.g. observation) can post-date the
+# axor-core build CI resolves, so treat its imports as untyped rather than errors.
+[[tool.mypy.overrides]]
+module = ["axor_core", "axor_core.*"]
+ignore_missing_imports = true

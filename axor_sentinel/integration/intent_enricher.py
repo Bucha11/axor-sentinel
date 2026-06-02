@@ -148,7 +148,7 @@ def derive_resource_info(tool: str, args: "Mapping[str, object]") -> dict:
     return resource_info
 
 
-def _infer_service(tool: str, args: dict) -> str:
+def _infer_service(tool: str, args: "Mapping[str, object]") -> str:
     """Infer the service/datasource name from tool name or args."""
     t = tool.lower()
     if "sharepoint" in t or "sp_" in t:
