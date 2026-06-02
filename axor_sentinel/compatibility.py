@@ -20,7 +20,7 @@ log = logging.getLogger("axor.sentinel.compat")
 # Inclusive lower bound, exclusive upper bound — the axor-core range these
 # sentinel contracts were validated against. Bump on contract-affecting releases.
 MIN_AXOR_CORE = (0, 7, 0)
-MAX_AXOR_CORE = (0, 8, 0)
+MAX_AXOR_CORE = (0, 9, 0)
 
 
 def _parse(version: str) -> tuple[int, int, int]:
