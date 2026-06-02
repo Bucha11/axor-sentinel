@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 from axor_sentinel.graph.normalizer import normalize_resource_id
 from axor_sentinel.sentinel.snapshot import ReputationSnapshot, load_snapshot
@@ -90,47 +90,65 @@ class SnapshotIntentEnricher:
         args = intent.payload.get("args", {})
         tool = intent.payload.get("tool", "")
 
-        resource_info: dict = {}
-
-        # Provider object IDs (SharePoint, OneDrive, etc.)
-        for key in ("provider_id", "item_id", "drive_item_id", "object_id"):
-            if key in args:
-                resource_info["provider_id"] = args[key]
-                break
-
-        # Path — covers file tools, URL tools, MCP resource URIs
-        path = (
-            args.get("path")
-            or args.get("file_path")
-            or args.get("file")
-            or args.get("url")
-            or args.get("uri")
-            or ""
-        )
-        if path:
-            resource_info["path"] = str(path)
-
-        # Service inference from tool name
-        service = _infer_service(tool, args)
-        if service:
-            resource_info["service"] = service
-
-        # Heuristic fields
-        if "filename" in args:
-            resource_info["filename"] = args["filename"]
-        if "size" in args:
-            resource_info["size"] = args["size"]
-        if "last_modified" in args:
-            resource_info["last_modified"] = args["last_modified"]
-
+        resource_info = derive_resource_info(tool, args)
         resource_id, _, _ = normalize_resource_id(resource_info)
 
         # Container ID: service + directory of the resource
-        container_id = _derive_container_id(path, service)
+        container_id = _derive_container_id(
+            resource_info.get("path", ""),
+            resource_info.get("service", ""),
+        )
         return resource_id, container_id
 
 
-def _infer_service(tool: str, args: dict) -> str:
+def derive_resource_info(tool: str, args: "Mapping[str, object]") -> dict:
+    """
+    Extract a normalizer-ready ``resource_info`` dict from a tool name + args.
+
+    Shared by SnapshotIntentEnricher (hot-path intent enrichment) and
+    CoreSessionSink (audit-cycle session mapping) so resource IDs are derived
+    identically on both paths. The keys produced here are exactly the keys
+    ``graph.normalizer.normalize_resource_id`` consumes
+    (provider_id / path / service / filename / size / last_modified).
+    """
+    args = args or {}
+    resource_info: dict = {}
+
+    # Provider object IDs (SharePoint, OneDrive, etc.)
+    for key in ("provider_id", "item_id", "drive_item_id", "object_id"):
+        if key in args:
+            resource_info["provider_id"] = args[key]
+            break
+
+    # Path — covers file tools, URL tools, MCP resource URIs
+    path = (
+        args.get("path")
+        or args.get("file_path")
+        or args.get("file")
+        or args.get("url")
+        or args.get("uri")
+        or ""
+    )
+    if path:
+        resource_info["path"] = str(path)
+
+    # Service inference from tool name
+    service = _infer_service(tool, args)
+    if service:
+        resource_info["service"] = service
+
+    # Heuristic fields
+    if "filename" in args:
+        resource_info["filename"] = args["filename"]
+    if "size" in args:
+        resource_info["size"] = args["size"]
+    if "last_modified" in args:
+        resource_info["last_modified"] = args["last_modified"]
+
+    return resource_info
+
+
+def _infer_service(tool: str, args: "Mapping[str, object]") -> str:
     """Infer the service/datasource name from tool name or args."""
     t = tool.lower()
     if "sharepoint" in t or "sp_" in t:
