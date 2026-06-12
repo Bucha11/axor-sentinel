@@ -50,13 +50,13 @@ def test_threshold_respects_fpr_budget():
     assert report.selected_threshold > 0.55
 
 
-def test_reports_current_constant_performance():
+def test_reports_current_threshold_performance():
     scenarios, scores = _dataset(
         attack_scores=[0.85, 0.9],
-        benign_scores=[0.0, 0.81],   # one benign above the shipped 0.8 constant
+        benign_scores=[0.0, 0.81],   # one benign above the evaluated flag threshold
     )
     report = calibrate_threshold(scenarios, scores, current_threshold=0.8)
-    # The shipped constant would false-positive on the 0.81 benign sample.
+    # A flag threshold of 0.8 would false-positive on the 0.81 benign sample.
     assert report.current_threshold_fpr == 0.5
     assert report.current_threshold_tpr == 1.0
 

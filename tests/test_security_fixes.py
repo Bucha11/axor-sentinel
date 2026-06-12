@@ -71,7 +71,7 @@ def test_tampered_scores_rejected_when_key_set(tmp_path, monkeypatch):
     monkeypatch.delenv(SNAPSHOT_KEY_ENV, raising=False)
     forged = ReputationSnapshot(
         version=2, generated_at=0.0,
-        resource_reputation={"r1": 0.0},  # downgraded to evade Phase-1 deny
+        resource_reputation={"r1": 0.0},  # suspicion downgraded to dodge the floor
         container_reputation={},
     ).with_checksum()  # checksum recomputed by attacker, but no signature
     atomic_swap(tmp_path, forged)

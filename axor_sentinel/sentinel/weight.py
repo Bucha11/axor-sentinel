@@ -7,7 +7,6 @@ from axor_sentinel.graph.model import HOT_WEIGHTS, SignalType
 FLAG_THRESHOLD: float = 0.7            # suspicion_score >= this → flagged=True
 BASE_CAUTION: float = 0.3             # base caution weight for adjacent resources
 CONTAINER_MEMBER_THRESHOLD: float = 0.2  # only members above this count toward container score
-REPUTATION_RULE_THRESHOLD: float = 0.8   # Phase 1 deterministic deny threshold
 
 
 # ── Core accumulation (logarithmic, invariant A-1) ─────────────────────────────
