@@ -436,6 +436,46 @@ handoff in core today; those were removed.
 
 ---
 
+## 10a. Security model & known limitations
+
+Sentinel is a **resource-centric** detector: it scores *patterns of access*, it does
+not authenticate *intent legitimacy*. Reputation feeds core as observe-only telemetry
+(it tightens degradation at most, never denies), which bounds the blast radius of the
+limitations below — a poisoned score cannot cause a wrong deny.
+
+- **Contributing sessions are not authenticated** (by design). Any session that
+  reaches the cycle contributes hot weight to whatever `resource_id` / `signal_type`
+  it claims, so an attacker who controls sessions can directly raise a resource's
+  score. Accumulation is bounded to `[0, 1]` and dampened, but the score is evidence
+  of *access concentration*, not attacker-proof intent. Do not treat a high score as
+  unforgeable.
+- **Anti-poisoning factors key on the claimed `taint_source`.** `origin_dampening`
+  and `source_diversity_factor` are keyed on `(resource_id, taint_source)`, and
+  `taint_source` is an attacker-influenceable origin label, not an authenticated
+  class. An attacker who rotates the source label resets the dampening — so the
+  factors raise the *cost* of single-origin hammering but do not stop a label-rotating
+  attacker. (Tracked as a follow-up — see `docs/deferred-followups.md`.)
+- **Time-decay wait-out.** Scores halve every 30 days with no floor for once-flagged
+  resources, so a slow-and-low attacker pacing staging beyond a decay half-life keeps
+  any single resource under threshold. The bench only exercises 7-day gaps.
+- **Fanout baseline is self-trained.** `_check_fanout` compares against the agent's
+  own smoothed baseline, which a patient attacker can walk upward ("boil the frog").
+  Cold-start (`session_count < 10`) and the `z <= 2.5` / `had_taint` guards are
+  threshold evasions inherent to the detector.
+- **Snapshot/state authentication is opt-in.** HMAC engages only with
+  `AXOR_SNAPSHOT_KEY` (fail-closed only under `AXOR_ENV=production` /
+  `AXOR_SNAPSHOT_REQUIRE_SIGNATURE`). The default checksum-only mode is forgeable by
+  any writer to the snapshot dir; `load_snapshot` now warns loudly when unauthenticated.
+  **Set the key in any real deployment** — the `sentinel_state.json` it also signs
+  gates the dampening/baseline counters across restarts.
+
+What is sound by construction: no raw session content crosses the boundary (the
+snapshot is `id → float` only); all Cypher is parameterized; the hot-path enricher is
+Neo4j-free and fail-safe; the snapshot swap is atomic and TOCTOU-safe; and the
+resource-id normalizer resolves symlinks so a resource cannot be aliased/split.
+
+---
+
 ## 11. Bench suite
 
 ### Dataset composition (paper baseline)
