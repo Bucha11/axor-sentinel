@@ -1,43 +1,57 @@
 """
-Integration tests for Phase 1 enforcement and Phase 2 gate.
+Integration tests for the observe-only reputation → degradation coupling.
 
-Covers invariants A-6, A-7, A-11, A-12 and spec adversarial test matrix:
-  - Phase 1: reputation >= 0.8 + external read → deterministic deny before ML (2 variants)
-  - Phase 2 gate: reputation floats not passed to Layer 2 until N_MIN_REAL_ATTACKS met (2 variants)
-  - flagged never passed as feature (A-7)
+Current axor-core treats reputation as TELEMETRY: the enricher populates
+target_resource_reputation / target_container_reputation on NormalizedIntent, and
+the ONLY enforcement coupling is the opt-in DegradationEngine(detection_floor=...)
+"tighten" path. Core never denies on reputation (no Phase-1 deny, no anomaly
+detector). These tests pin:
+  - the suspicion→reputation polarity conversion at the enricher boundary,
+  - that a suspicious resource TIGHTENS degradation while the call still executes
+    (observe-only — never a deny), and a benign one does not,
+  - the long-standing A-7 invariant (no 'flagged' feature on NormalizedIntent).
 """
 from __future__ import annotations
 
+import dataclasses
 import sys
+import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 # Need axor-core on the path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "axor-core"))
 
-from axor_core.contracts.anomaly import AnomalyClass, AnomalyResult, NormalizedIntent
+from axor_core.contracts.anomaly import NormalizedIntent
 from axor_core.contracts.cancel import make_token
 from axor_core.contracts.context import (
     ContextFragment, ContextView, LineageSummary,
 )
+from axor_core.contracts.degradation import DegradationLevel
 from axor_core.contracts.envelope import Capabilities, ExecutionEnvelope, ExportContract
 from axor_core.contracts.intent import Intent, IntentKind
 from axor_core.contracts.result import ExecutorEvent, ExecutorEventKind
-from axor_core.capability.executor import CapabilityExecutor
+from axor_core.capability.executor import CapabilityExecutor, ToolHandler
+from axor_core.degradation.engine import DegradationEngine
+from axor_core.node.intent_loop import IntentLoop
 from axor_core.policy.presets import standard as standard_policy
-from axor_sentinel.integration.intent_enricher import SnapshotIntentEnricher
-from axor_sentinel.integration.phase import (
-    N_MIN_REAL_ATTACKS,
-    MAX_FP_RATE,
-    is_phase2_active,
+from axor_sentinel.graph.normalizer import normalize_resource_id
+from axor_sentinel.integration.intent_enricher import (
+    SnapshotIntentEnricher,
+    _suspicion_to_reputation,
+    derive_resource_info,
 )
-from axor_sentinel.sentinel.snapshot import ReputationSnapshot
+from axor_sentinel.sentinel.snapshot import ReputationSnapshot, atomic_swap
+from axor_sentinel.sentinel.weight import FLAG_THRESHOLD
+
+# Operator wiring: core tightens when reputation <= detection_floor; a sentinel-
+# flagged resource (suspicion >= FLAG_THRESHOLD) converts to 1 - suspicion, so the
+# matching floor is 1 - FLAG_THRESHOLD.
+_FLOOR = 1.0 - FLAG_THRESHOLD
 
 
 def _make_envelope(allowed_tools: frozenset[str] = frozenset({"read"})) -> ExecutionEnvelope:
-    """Build a minimal test envelope."""
     policy = standard_policy()
     lineage = LineageSummary(
         node_id="n1", parent_id=None, depth=0,
@@ -65,41 +79,23 @@ def _make_envelope(allowed_tools: frozenset[str] = frozenset({"read"})) -> Execu
     )
     export = ExportContract(mode="deny", allowed_fields=frozenset(), max_export_tokens=None)
     return ExecutionEnvelope(
-        node_id="n1",
-        task="test",
-        context=ctx,
-        policy=policy,
-        capabilities=caps,
-        export_contract=export,
-        lineage=lineage,
-        cancel_token=make_token(),
+        node_id="n1", task="test", context=ctx, policy=policy, capabilities=caps,
+        export_contract=export, lineage=lineage, cancel_token=make_token(),
     )
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _make_normalized(
-    after_external_read: bool = False,
-    resource_rep: float = 0.0,
-) -> NormalizedIntent:
+def _make_normalized(after_external_read: bool = False, resource_rep: float = 0.0) -> NormalizedIntent:
     return NormalizedIntent(
-        tool="read",
-        operation="file_read",
-        target_kind="workdir",
-        destination_kind="none",
-        provenance="repo",
-        reads_secret_like_data=False,
-        writes_outside_workdir=False,
-        executes_generated_code=False,
-        after_external_read=after_external_read,
-        after_secret_access=False,
-        data_flow="local_to_local",
-        target_resource_reputation=resource_rep,
-        target_container_reputation=0.0,
+        tool="read", operation="file_read", target_kind="workdir",
+        destination_kind="none", provenance="repo",
+        reads_secret_like_data=False, writes_outside_workdir=False,
+        executes_generated_code=False, after_external_read=after_external_read,
+        after_secret_access=False, data_flow="local_to_local",
+        target_resource_reputation=resource_rep, target_container_reputation=0.0,
     )
 
 
-def _make_intent(path: str = "/data/secret.txt") -> Intent:
+def _make_intent(path: str = "/data/r.txt") -> Intent:
     return Intent(
         kind=IntentKind.TOOL_CALL,
         payload={"tool": "read", "args": {"path": path}},
@@ -107,99 +103,74 @@ def _make_intent(path: str = "/data/secret.txt") -> Intent:
     )
 
 
-class _StubEnricher:
-    """Stub enricher that injects a fixed reputation score."""
+class _ReadHandler(ToolHandler):
+    @property
+    def name(self) -> str:
+        return "read"
+
+    async def execute(self, args) -> str:
+        return "content"
+
+
+class _FixedReputationEnricher:
+    """Stamps a fixed (already core-polarity) reputation, to drive the loop wiring."""
     def __init__(self, reputation: float):
         self._rep = reputation
 
     def enrich(self, normalized: NormalizedIntent, intent: Intent) -> NormalizedIntent:
-        import dataclasses
         return dataclasses.replace(normalized, target_resource_reputation=self._rep)
 
 
-# ── Phase 1 enforcement — 2 variants ──────────────────────────────────────────
+# ── polarity conversion ───────────────────────────────────────────────────────
 
-class TestPhase1Enforcement:
-    """
-    Invariant A-11: reputation >= 0.8 AND after_external_read → deterministic deny
-    before anomaly detector (Layer 2) is invoked.
-    """
+class TestPolarityConversion:
+    def test_zero_suspicion_is_unknown(self):
+        # 0.0 suspicion → 0.0 reputation = core "unknown" (never crosses).
+        assert _suspicion_to_reputation(0.0) == 0.0
 
-    @pytest.mark.asyncio
-    async def test_phase1_deny_fires_before_anomaly_detector(self, tmp_path):
-        """
-        When resource reputation >= 0.8 and after_external_read=True,
-        the Phase 1 rule must deny before the anomaly detector is called.
-        Mock anomaly detector call count must be 0.
-        """
-        from axor_core.node.intent_loop import IntentLoop
+    def test_high_suspicion_maps_to_low_reputation(self):
+        # high suspicion = bad → LOW trust reputation (crosses the floor).
+        assert _suspicion_to_reputation(0.9) == pytest.approx(0.1)
+        assert _suspicion_to_reputation(FLAG_THRESHOLD) == pytest.approx(1 - FLAG_THRESHOLD)
 
-        # Mock anomaly detector — should NOT be called
-        mock_detector = MagicMock()
-        mock_detector.score = AsyncMock(
-            return_value=AnomalyResult(score=0.0, cls=AnomalyClass.NORMAL)
-        )
+    def test_low_suspicion_maps_to_high_reputation(self):
+        # benign-but-known → HIGH trust (does not cross a sane floor).
+        assert _suspicion_to_reputation(0.1) == pytest.approx(0.9)
 
-        # Stub enricher injects high reputation
-        enricher = _StubEnricher(reputation=0.85)
+    def test_max_suspicion_does_not_collapse_to_unknown(self):
+        # suspicion 1.0 must NOT become 0.0 ("unknown", never crosses) — fail-open.
+        r = _suspicion_to_reputation(1.0)
+        assert 0.0 < r <= _FLOOR
 
-        # Mock capability executor — should NOT be reached
-        mock_executor = MagicMock(spec=CapabilityExecutor)
-        mock_executor.execute = AsyncMock(return_value={"result": "content"})
+    def test_enricher_converts_suspicion_to_reputation(self, tmp_path):
+        # The snapshot stores suspicion; the enricher hands core the converted trust.
+        info = derive_resource_info("read", {"path": "/data/r.txt"})
+        rid, _, _ = normalize_resource_id(info)
+        snap = ReputationSnapshot(
+            version=1, generated_at=time.time(),
+            resource_reputation={rid: 0.9},   # suspicion 0.9
+            container_reputation={},
+        ).with_checksum()
+        atomic_swap(tmp_path, snap)
+        enricher = SnapshotIntentEnricher.from_dir(tmp_path)
+        result = enricher.enrich(_make_normalized(after_external_read=True), _make_intent("/data/r.txt"))
+        assert result.target_resource_reputation == pytest.approx(0.1)  # 1 - 0.9
 
+
+# ── observe-only: tighten degradation, never deny ─────────────────────────────
+
+class TestObserveOnlyDegradation:
+    async def _run(self, enricher, floor):
+        ex = CapabilityExecutor()
+        ex.register(_ReadHandler())
+        deg = DegradationEngine(detection_floor=floor)
         loop = IntentLoop(
-            capability_executor=mock_executor,
-            trace_events=[],
-            anomaly_detector=mock_detector,
-            reputation_enricher=enricher,
+            capability_executor=ex, trace_events=[],
+            degradation_engine=deg, reputation_enricher=enricher,
         )
-        envelope = _make_envelope(frozenset({"read"}))
+        env = _make_envelope(frozenset({"read"}))
 
-        async def fake_stream():
-            yield ExecutorEvent(
-                kind=ExecutorEventKind.TOOL_USE,
-                payload={"tool": "read", "tool_use_id": "tu1", "args": {"path": "/data/secret.txt"}},
-                node_id="n1",
-            )
-            yield ExecutorEvent(kind=ExecutorEventKind.STOP, payload={"usage": {}}, node_id="n1")
-
-        # Patch normalizer to return after_external_read=True; enricher sets rep to 0.85
-        with patch.object(loop._normalizer, "normalize") as mock_normalize:
-            mock_normalize.return_value = _make_normalized(after_external_read=True, resource_rep=0.0)
-            [e async for e in loop.run(fake_stream(), envelope)]
-
-        # Anomaly detector must NOT have been called (Phase 1 fired first, A-11)
-        assert mock_detector.score.call_count == 0
-        # Executor must NOT have been called (denied before execution)
-        assert mock_executor.execute.call_count == 0
-
-    @pytest.mark.asyncio
-    async def test_phase1_no_trigger_below_threshold(self, tmp_path):
-        """
-        reputation=0.7 (< 0.8) with after_external_read=True → Phase 1 does NOT fire.
-        Anomaly detector IS called normally.
-        """
-        from axor_core.node.intent_loop import IntentLoop
-
-        mock_detector = MagicMock()
-        mock_detector.score = AsyncMock(
-            return_value=AnomalyResult(score=0.0, cls=AnomalyClass.NORMAL)
-        )
-
-        enricher = _StubEnricher(reputation=0.7)  # below threshold
-
-        mock_executor = MagicMock(spec=CapabilityExecutor)
-        mock_executor.execute = AsyncMock(return_value={"result": "ok"})
-
-        loop = IntentLoop(
-            capability_executor=mock_executor,
-            trace_events=[],
-            anomaly_detector=mock_detector,
-            reputation_enricher=enricher,
-        )
-        envelope = _make_envelope(frozenset({"read"}))
-
-        async def fake_stream():
+        async def stream():
             yield ExecutorEvent(
                 kind=ExecutorEventKind.TOOL_USE,
                 payload={"tool": "read", "tool_use_id": "tu1", "args": {"path": "/data/r.txt"}},
@@ -207,65 +178,40 @@ class TestPhase1Enforcement:
             )
             yield ExecutorEvent(kind=ExecutorEventKind.STOP, payload={"usage": {}}, node_id="n1")
 
-        with patch.object(loop._normalizer, "normalize") as mock_normalize:
-            mock_normalize.return_value = _make_normalized(after_external_read=True)
-            [e async for e in loop.run(fake_stream(), envelope)]
+        events = [e async for e in loop.run(stream(), env)]
+        return loop, events
 
-        # Anomaly detector SHOULD have been called (Phase 1 did not fire)
-        assert mock_detector.score.call_count >= 1
+    @pytest.mark.asyncio
+    async def test_suspicious_resource_tightens_but_does_not_deny(self):
+        # suspicion 0.9 → reputation 0.1 <= floor 0.3 → core TIGHTENS to RESTRICTED.
+        loop, events = await self._run(_FixedReputationEnricher(0.1), _FLOOR)
+        assert loop._degradation_engine.state.level >= DegradationLevel.RESTRICTED
+        # But the call still executed — reputation is observe-only, never a deny.
+        approved = [e for e in events if e.payload.get("approved") is True]
+        assert approved, "the read must still execute; reputation never denies"
 
-
-# ── Phase 2 gate — 2 variants ─────────────────────────────────────────────────
-
-class TestPhase2Gate:
-    def test_phase2_not_active_below_min_attacks(self):
-        """Invariant A-12: N < 50 confirmed incidents → Phase 2 inactive."""
-        assert not is_phase2_active(49, 0.01)
-        assert not is_phase2_active(0, 0.0)
-
-    def test_phase2_not_active_high_fp_rate(self):
-        """Phase 2 inactive if fp_rate > MAX_FP_RATE even with enough incidents."""
-        assert not is_phase2_active(N_MIN_REAL_ATTACKS, MAX_FP_RATE + 0.001)
-
-    def test_phase2_activates_when_conditions_met(self):
-        """Phase 2 active when both conditions satisfied."""
-        assert is_phase2_active(N_MIN_REAL_ATTACKS, MAX_FP_RATE)
-        assert is_phase2_active(100, 0.01)
+    @pytest.mark.asyncio
+    async def test_benign_resource_does_not_tighten(self):
+        # suspicion 0.1 → reputation 0.9 > floor 0.3 → NO crossing, stays NORMAL.
+        loop, _ = await self._run(_FixedReputationEnricher(0.9), _FLOOR)
+        assert loop._degradation_engine.state.level == DegradationLevel.NORMAL
 
 
-# ── flagged never a Layer 2 feature — invariant A-7 ───────────────────────────
+# ── flagged never a feature — invariant A-7 ───────────────────────────────────
 
 class TestFlaggedNotAFeature:
     def test_normalized_intent_has_no_flagged_field(self):
-        """
-        Invariant A-7: NormalizedIntent has no 'flagged' field.
-        The anomaly detector (Layer 2) cannot receive flagged as a feature because
-        the field simply doesn't exist on NormalizedIntent.
-        """
-        import dataclasses
         field_names = {f.name for f in dataclasses.fields(NormalizedIntent)}
         assert "flagged" not in field_names
 
     def test_enricher_does_not_add_flagged_field(self, tmp_path):
-        """SnapshotIntentEnricher only populates the two reputation float fields."""
-        import dataclasses
-        import time
-        from axor_sentinel.sentinel.snapshot import atomic_swap
-
         snap = ReputationSnapshot(
             version=1, generated_at=time.time(),
             resource_reputation={"/data/r.txt": 0.9},
             container_reputation={},
         ).with_checksum()
         atomic_swap(tmp_path, snap)
-
         enricher = SnapshotIntentEnricher.from_dir(tmp_path)
-        ni = _make_normalized(after_external_read=True)
-        intent = _make_intent("/data/r.txt")
-        result = enricher.enrich(ni, intent)
-
+        result = enricher.enrich(_make_normalized(after_external_read=True), _make_intent("/data/r.txt"))
         field_names = {f.name for f in dataclasses.fields(result)}
         assert "flagged" not in field_names
-        # Only the two reputation fields should differ
-        assert result.target_resource_reputation >= 0.0
-        assert result.target_container_reputation >= 0.0
