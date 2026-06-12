@@ -18,7 +18,7 @@
 
 ## 1. Overview
 
-axor-sentinel is a background analysis layer that sits alongside axor-core's per-session anomaly detector (Layer 2). It answers a question Layer 2 cannot: *has this resource been systematically probed across many sessions over time?*
+axor-sentinel is a background analysis layer for axor-core. It answers a question per-session enforcement cannot: *has this resource been systematically probed across many sessions over time?* The answer is fed to core as **observe-only telemetry** — it can tighten degradation at most, never deny.
 
 It does this by maintaining a **resource reputation graph** in Neo4j and publishing a lightweight **reputation snapshot** that the hot path reads without any database I/O.
 
@@ -38,8 +38,10 @@ It does this by maintaining a **resource reputation graph** in Neo4j and publish
 │  ├─ IntentNormalizer   → NormalizedIntent           │
 │  ├─ SnapshotIntentEnricher ← axor-sentinel         │
 │  │   └─ populates target_resource_reputation        │
-│  ├─ Phase 1 rule (deterministic deny)               │
-│  └─ AnomalyDetector (Layer 2, ML)                  │
+│  │      (telemetry — never gates)                   │
+│  └─ DegradationEngine.record_detection (opt-in)     │
+│      └─ reputation <= detection_floor → TIGHTEN     │
+│         degradation (never deny)                    │
 └─────────────────────────────────────────────────────┘
          ↑ reads snapshot (no Neo4j on hot path)
 ┌─────────────────────────────────────────────────────┐
@@ -55,7 +57,7 @@ It does this by maintaining a **resource reputation graph** in Neo4j and publish
 └─────────────────────────────────────────────────────┘
 ```
 
-**Dependency direction:** axor-core never imports axor-sentinel. axor-core defines the `ReputationEnricher` protocol in `axor_core.contracts.reputation`; axor-sentinel implements it. Same pattern as `AnomalyDetector`.
+**Dependency direction:** axor-core never imports axor-sentinel. axor-core defines the `ReputationEnricher` protocol in `axor_core.contracts.reputation`; axor-sentinel implements it. The only enforcement consumer of the enriched fields is core's `DegradationEngine.record_detection` (opt-in, tightening-only).
 
 ---
 
@@ -74,7 +76,8 @@ axor_sentinel/
 │   └── cycle.py          # SentinelCycle — the audit loop
 ├── integration/
 │   ├── intent_enricher.py  # SnapshotIntentEnricher (ReputationEnricher impl)
-│   └── phase.py            # Phase 2 gate: is_phase2_active()
+│   ├── core_sink.py        # CoreSessionSink (forward: ingest closed sessions)
+│   └── probe_bridge.py     # ProbeTaintBridge (probe-flagged sessions)
 ├── reports/
 │   └── slow_and_low.py   # SlowAndLowReport — wraps slow-and-low Cypher query
 └── bench/
@@ -340,13 +343,18 @@ snapshot = load_snapshot(snapshot_dir)
 
 ### SnapshotIntentEnricher
 
-Implements `axor_core.contracts.reputation.ReputationEnricher`. Called by `IntentLoop` after `IntentNormalizer.normalize()`, before Phase 1 check.
+Implements `axor_core.contracts.reputation.ReputationEnricher`. Called by `IntentLoop` after `IntentNormalizer.normalize()`; the enriched fields are telemetry consumed only by the opt-in degradation floor (never a gate).
 
 ```python
+# The snapshot stores SUSPICION (high = bad); core's reputation field is TRUST
+# (a positive reading <= detection_floor crosses and tightens; 0.0 = unknown).
+# Convert at the boundary so core tightens on suspicious resources, not benign ones.
 enriched = dataclasses.replace(
     normalized,
-    target_resource_reputation=snapshot.resource_reputation.get(resource_id, 0.0),
-    target_container_reputation=snapshot.container_reputation.get(container_id, 0.0),
+    target_resource_reputation=_suspicion_to_reputation(
+        snapshot.resource_reputation.get(resource_id, 0.0)),
+    target_container_reputation=_suspicion_to_reputation(
+        snapshot.container_reputation.get(container_id, 0.0)),
 )
 ```
 
@@ -354,41 +362,27 @@ enriched = dataclasses.replace(
 - Never queries Neo4j (A-6) — reads pre-loaded snapshot only
 - Never raises — failures are logged, original intent returned
 - Resource ID derived from intent args via `graph/normalizer.py` (same 3-tier normalization)
+- Converts suspicion → trust polarity at the boundary (`reputation = 1 - suspicion`, clamped above 0)
 
-### Phase 1 deterministic deny (A-11)
+### Observe-only coupling (reputation never denies)
 
-In `IntentLoop._resolve_tool_intent()`:
+In core's `IntentLoop`, after enrichment the reputation signal is recorded into the
+degradation engine and nowhere else:
 
 ```python
-# Anomaly window receives pre-enrichment NormalizedIntent (A-11)
-normalized_for_layer2 = normalized
-
 if reputation_enricher:
     normalized = enricher.enrich(normalized, intent)
-
-# Phase 1 rule — fires before Layer 2 ML
-if normalized.target_resource_reputation >= 0.8 and normalized.after_external_read:
-    return deny("reputation enforcement", "high_reputation_resource_tainted_access")
-
-# Layer 2 uses pre-enrichment intent (reputation floats not passed to ML — A-11)
-if anomaly_detector:
-    intent_window.append(normalized_for_layer2)
+    if degradation_engine:                       # opt-in
+        degradation_engine.record_detection(normalized)   # tightening-only
 ```
 
-**Why `normalized_for_layer2`?** Reputation floats must not reach the ML model until Phase 2 is active (`N_MIN_REAL_ATTACKS >= 50` confirmed attacks with `FP_RATE <= 0.02`). In Phase 1, the model was calibrated without reputation features.
-
-### Phase 2 gate
-
-```python
-# integration/phase.py
-N_MIN_REAL_ATTACKS = 50
-MAX_FP_RATE = 0.02
-
-def is_phase2_active(confirmed_incidents: int, fp_rate: float) -> bool:
-    return confirmed_incidents >= N_MIN_REAL_ATTACKS and fp_rate <= MAX_FP_RATE
-```
-
-Until both conditions are met, reputation floats are used only for the deterministic Phase 1 rule, not passed to Layer 2.
+`record_detection` is a **no-op unless a `detection_floor` is configured**, and when
+configured it can only *tighten* the session to RESTRICTED (monotone) — it never
+returns an allow/deny and never loosens. The operator pairs the floor with the
+suspicion flag threshold: `detection_floor = 1 - FLAG_THRESHOLD` (default `0.3`), so
+a sentinel-flagged resource (suspicion `>= FLAG_THRESHOLD` → reputation `<= floor`)
+crosses and tightens. There is no Phase-1 deterministic deny and no Layer-2 ML
+handoff in core today; those were removed.
 
 ---
 
@@ -398,7 +392,7 @@ Until both conditions are met, reputation floats are used only for the determini
 
 **Pattern:** Single agent reads from sensitive resources across N sessions spread over `gap_days`, then issues an export.
 
-**Detection mechanism:** Hot weights accumulate on the staging resources across sessions. By the time the export session arrives, the target resources have `suspicion_score >= FLAG_THRESHOLD`. Phase 1 denies the export session.
+**Detection mechanism:** Hot weights accumulate on the staging resources across sessions. By the time the export session arrives, the target resources have `suspicion_score >= FLAG_THRESHOLD`. The enricher then feeds core a reputation `<= detection_floor`, which (opt-in) tightens the export session's degradation level — narrowing its surface. It does not deny; core's per-session gates remain the only deny path.
 
 **Config variants in bench:** 2, 4, 8 staging sessions × 7-day gap × 2 noise sessions interspersed.
 
@@ -428,12 +422,12 @@ Until both conditions are met, reputation floats are used only for the determini
 | A-4 | Decay runs first in every audit cycle, before any hot weight | `cycle.py`: `apply_decay()` before session loop |
 | A-5 | Checksum verified from in-memory bytes before snapshot is made visible | `atomic_swap()`: `_verify_checksum_bytes(serialized.encode(), checksum)` |
 | A-6 | No Neo4j call on the hot path | `SnapshotIntentEnricher.enrich()` reads dict only |
-| A-7 | `flagged` is never a feature passed to Layer 2 | `NormalizedIntent` has no `flagged` field |
+| A-7 | `flagged` is never exposed as a feature on the intent | `NormalizedIntent` has no `flagged` field |
 | A-8 | `effective_weight = raw × confidence × diversity × dampening` | `compute_effective_weight()` in `weight.py` |
 | A-9 | Container score recomputed after every member score change | `cycle.run_once()` step 2f |
 | A-10 | Fanout flat 0.5 applied as separate `accumulate()` after hot weight | `cycle.py` lines 172–174 |
-| A-11 | Anomaly window receives pre-enrichment `NormalizedIntent` | `intent_loop.py`: `normalized_for_layer2 = normalized` before `enrich()` |
-| A-12 | Reputation floats not passed to ML until Phase 2 active | `is_phase2_active()` gate; `normalized_for_layer2` used for `intent_window` |
+| A-11 | Reputation is observe-only — it never denies | core `record_detection` is tightening-only, no deny path |
+| A-12 | Reputation acts only via the opt-in degradation floor | `detection_floor` unset → `record_detection` is a no-op |
 | A-13 | `origin_dampening` never zero, never > 1 | `0.5^n ∈ (0, 1]` for all n ≥ 0 |
 | A-14 | Fanout detection disabled for agents with < 10 sessions | `_check_fanout()`: `baseline.session_count < FANOUT_MIN_SESSIONS → None` |
 | A-15 | Fanout requires: `had_taint AND z > 2.5 AND signal ≥ READ_SUMMARIZE` | `_check_fanout()` checks all three |
