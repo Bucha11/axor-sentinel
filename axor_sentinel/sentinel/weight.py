@@ -104,25 +104,6 @@ def compute_hot_weight(signal_type: SignalType) -> float:
     return HOT_WEIGHTS[signal_type]
 
 
-# ── Caution weight computation ─────────────────────────────────────────────────
-
-def compute_caution_weight(
-    topology_factor: float,
-    days_since_last_decay: float,
-    canonical_confidence: float,
-) -> float:
-    """
-    Caution weight for a resource adjacent to a hot resource:
-        effective = BASE_CAUTION * topology_factor * time_decay * canonical_confidence
-
-    Note: canonical_confidence scaling is applied here (it is part of effective_weight,
-    invariant A-8). The base formula uses time_decay against last_decay_at of the
-    neighbor (not the hot resource).
-    """
-    decay = time_decay(days_since_last_decay)
-    return BASE_CAUTION * topology_factor * decay * canonical_confidence
-
-
 # ── Container aggregation ──────────────────────────────────────────────────────
 
 def compute_container_score(member_scores: list[float]) -> float:

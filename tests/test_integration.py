@@ -36,11 +36,11 @@ from axor_core.capability.executor import CapabilityExecutor, ToolHandler
 from axor_core.degradation.engine import DegradationEngine
 from axor_core.node.intent_loop import IntentLoop
 from axor_core.policy.presets import standard as standard_policy
+from axor_sentinel.graph.derive import derive_resource_info
 from axor_sentinel.graph.normalizer import normalize_resource_id
 from axor_sentinel.integration.intent_enricher import (
     SnapshotIntentEnricher,
     _suspicion_to_reputation,
-    derive_resource_info,
 )
 from axor_sentinel.sentinel.snapshot import ReputationSnapshot, atomic_swap
 from axor_sentinel.sentinel.weight import FLAG_THRESHOLD

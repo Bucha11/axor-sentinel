@@ -3,12 +3,9 @@ from __future__ import annotations
 import logging
 from typing import Mapping, Protocol, Sequence, runtime_checkable
 
+from axor_sentinel.graph.derive import derive_container_id, derive_resource_info
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.graph.normalizer import normalize_resource_id
-from axor_sentinel.integration.intent_enricher import (
-    _derive_container_id,
-    derive_resource_info,
-)
 from axor_sentinel.sentinel.cycle import ResourceAccess, SessionSummary
 
 
@@ -165,7 +162,7 @@ class CoreSessionSink:
         """
         resource_info = derive_resource_info(inv.tool, inv.args)
         resource_id, _method, confidence = normalize_resource_id(resource_info)
-        container_id = _derive_container_id(
+        container_id = derive_container_id(
             resource_info.get("path", ""),
             resource_info.get("service", ""),
         )
