@@ -15,13 +15,19 @@ code, doc drift, and snapshot hardening (F7/F8) were already fixed.
   on crash); version is in the signed state blob.
 - **#1 dual-write — PARTIALLY DONE.** The hand-tuned pre-scale drift is gone:
   `compute_weight_factors` is the single source for both the in-memory `effective`
-  weight and the Cypher `without_confidence`. The full Neo4j-authoritative read-back
-  (which would also fold caution/decay into the same-cycle snapshot) is **not** done —
-  it needs a real Neo4j to validate and the env has none (the test mock does not
-  execute Cypher). Item 1 below is rescoped to that remaining read-back work.
-- **#3 F1 anti-poisoning keying — DONE.** Dampening/diversity now key on
-  `mitigation_origin` (authenticated `source_class` if attested, else `agent_id`),
-  not the attacker-controllable `taint_source`. Item 3 below records the residual.
+  weight and the Cypher `without_confidence`. Read-back FEATURE phase 1 has since
+  landed: the broken Cypher is fixed (two-sided `[0,1]` clamp), `upsert_session` +
+  `read_resource_scores` exist and are validated end-to-end against a live Neo4j (now
+  run in CI via a `neo4j` service). Still **not** done: rewiring `run_once` to the
+  read-back path (and an `ADJACENT_TO` topology producer for caution). Item 1 below.
+- **#3 F1 anti-poisoning keying — DONE.** Dampening/diversity key on
+  `mitigation_origin` (authenticated `source_class` if attested, else `agent_id`,
+  else the constant `"unattributed"` — never `taint_source`). Item 3 records the
+  residual (agent-identity authentication).
+- **Review round-2 follow-ups — DONE.** Two-sided score clamp; constant origin
+  fallback (no `taint_source`); empty-`resource_id` accesses dropped (path-less
+  egress no longer collides onto one node); CI `neo4j` service so the live
+  parse-guard + read-back tests run; `probe_bridge` test coverage (was 0%).
 
 ---
 
@@ -44,15 +50,16 @@ Neo4j write path was not merely lagging — it was **non-functional**:
    which is a **syntax error on Neo4j 5.x**; they would crash on any real server.
    (Now fixed: scalar `CASE WHEN new > 1.0 THEN 1.0 ELSE new END`, validated end-to-
    end against Neo4j 5.26 — see `tests/test_neo4j_integration.py`.)
-2. Sentinel **never creates any graph nodes/edges** (no `MERGE`/`CREATE` anywhere),
-   so even the parseable queries match nothing on the graph nobody populates. The
-   in-memory Python path is the only working, tested scorer; the Cypher writes have
-   never run against a real graph.
+2. Sentinel **created no graph nodes/edges at the time** (no `MERGE`/`CREATE`
+   anywhere), so even the parseable queries matched nothing on the graph nobody
+   populated. The in-memory Python path was the only working, tested scorer.
+   (Construction layer landed since: `upsert_session` in `graph/queries.py` now
+   MERGEs the nodes/edges — but `run_once` is not yet rewired to it; see Status.)
 
 **So full "Neo4j-authoritative read-back" is a FEATURE, not a refactor.** It needs:
 (a) a graph-construction layer — upsert `Session`/`Resource`/`Agent` nodes +
-`ACCESSED`/`IN_SESSION` edges per cycle (none of this exists); (b) a source for the
-`ADJACENT_TO` topology the caution query walks (no producer in sentinel, so caution
+`ACCESSED`/`IN_SESSION` edges per cycle (**done**: `upsert_session`); (b) a source
+for the `ADJACENT_TO` topology the caution query walks (no producer in sentinel, so caution
 is inert regardless); (c) then build the snapshot by reading scores back from Neo4j
 after all writes, deleting the Python re-accumulation. Validate with the live-Neo4j
 test harness (`AXOR_TEST_NEO4J_BOLT`).
@@ -100,9 +107,10 @@ dual-write, so there is one scoring code path.
 
 ## 5. `FanoutSignal.window_minutes` vestigial — NIT
 
-Always written `0.0` (`cycle.py`), and the `events.py` docstring still says "within a
-window". Either compute a real window or drop the field (a public event field, so
-removing it is a minor breaking change — bundle with the next event-schema revision).
+`FanoutSignal.window_minutes` (`events.py`) is always written `0.0` by the cycle —
+a vestigial field. Either compute a real window or drop the field (a public event
+field, so removing it is a minor breaking change — bundle with the next event-schema
+revision).
 
 ## Not planned (accepted, with rationale)
 - **No authentication of contributing sessions (F2)** — by design (resource-centric);

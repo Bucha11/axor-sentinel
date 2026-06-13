@@ -68,7 +68,10 @@ axor_sentinel/
 ├── graph/
 │   ├── model.py          # Node/edge dataclasses, SignalType enum
 │   ├── normalizer.py     # Resource ID normalization (3-tier)
-│   └── queries.py        # Cypher query strings + runner functions
+│   ├── derive.py         # Shared resource/container id derivation (hot + audit paths)
+│   └── queries.py        # Cypher query strings + runner functions, incl. the
+│                         #   construction (upsert_session) + read-back
+│                         #   (read_resource_scores) layer — see §8a
 ├── sentinel/
 │   ├── events.py         # ReputationEvent, FanoutSignal, AgentContainerBaseline
 │   ├── weight.py         # All weight math (pure Python, no I/O)
@@ -292,6 +295,29 @@ Baseline is updated with exponential smoothing (α=0.3) after each session windo
 
 ---
 
+## 6a. Graph construction & read-back (read-back feature, in progress)
+
+Historically sentinel never created any graph nodes/edges, so the Cypher
+weight/decay/detection queries had nothing to MATCH and the **in-memory Python path
+was the only working scorer** (Neo4j writes were a mirror). Two building blocks now
+exist in `graph/queries.py`:
+
+- `upsert_session` — MERGEs the `Agent`/`Session`/`Resource` nodes and
+  `IN_SESSION`/`ACCESSED` edges for a session (the construction layer the queries
+  need).
+- `read_resource_scores` — reads the accumulated scores back from Neo4j.
+
+The end state ("Neo4j is the system of record"): `run_once` would upsert → decay →
+hot/fanout/caution writes → `read_resource_scores` → snapshot, deleting the Python
+re-accumulation. **Status: building blocks landed and validated end-to-end against a
+live Neo4j (`tests/test_neo4j_integration.py`, run in CI via a `neo4j` service); but
+`run_once` is NOT yet rewired — it still builds the snapshot from the in-memory
+`scores` dict.** Remaining before the switch: a producer for the `ADJACENT_TO`
+topology (else the caution query stays inert), and converting the cycle's scoring
+tests to the live path. See `docs/deferred-followups.md §1`.
+
+---
+
 ## 7. Snapshot subsystem
 
 `sentinel/snapshot.py`
@@ -425,7 +451,7 @@ handoff in core today; those were removed.
 | A-7 | `flagged` is never exposed as a feature on the intent | `NormalizedIntent` has no `flagged` field |
 | A-8 | `effective_weight = raw × confidence × diversity × dampening` | `compute_effective_weight()` in `weight.py` |
 | A-9 | Container score recomputed after every member score change | `cycle.run_once()` step 2f |
-| A-10 | Fanout flat 0.5 applied as separate `accumulate()` after hot weight | `cycle.py` lines 172–174 |
+| A-10 | Fanout flat 0.5 applied as separate `accumulate()` after hot weight | `cycle.py` `_run_once_locked` (fanout boost is a separate `accumulate` call) |
 | A-11 | Reputation is observe-only — it never denies | core `record_detection` is tightening-only, no deny path |
 | A-12 | Reputation acts only via the opt-in degradation floor | `detection_floor` unset → `record_detection` is a no-op |
 | A-13 | `origin_dampening` never zero, never > 1 | `0.5^n ∈ (0, 1]` for all n ≥ 0 |
@@ -452,12 +478,14 @@ limitations below — a poisoned score cannot cause a wrong deny.
 - **Anti-poisoning factors key on the actor identity, not the claimed source label.**
   `origin_dampening` and `source_diversity_factor` key on `SessionSummary.mitigation_origin`
   — the authenticated `source_class` core attests when available, else the `agent_id`
-  — never the attacker-controllable `taint_source` label. So rotating the source label
-  no longer resets dampening (the F1 fix); an attacker would have to rotate the actor
-  identity, which requires distinct authenticated principals. Residual: if `agent_id`
-  itself is not authenticated upstream (no `source_class` attested), an attacker who
-  can spin up distinct agent identities can still spread the count — bounded by
-  observe-only core, and fully closed once core attests `source_class`.
+  — never the attacker-controllable `taint_source` label. If both are absent it falls
+  back to the constant `"unattributed"` (one conservative max-dampened bucket), never
+  to `taint_source` — so the attacker label can never become the dedup key. Rotating
+  the source label thus cannot reset dampening (the F1 fix); an attacker would have to
+  rotate the actor identity. Residual: if `agent_id` itself is not authenticated
+  upstream (no `source_class` attested), an attacker who can spin up distinct agent
+  identities can still spread the count — bounded by observe-only core, and fully
+  closed once core attests `source_class`.
 - **Time-decay wait-out.** Scores halve every 30 days with no floor for once-flagged
   resources, so a slow-and-low attacker pacing staging beyond a decay half-life keeps
   any single resource under threshold. The bench only exercises 7-day gaps.
@@ -471,6 +499,13 @@ limitations below — a poisoned score cannot cause a wrong deny.
   any writer to the snapshot dir; `load_snapshot` now warns loudly when unauthenticated.
   **Set the key in any real deployment** — the `sentinel_state.json` it also signs
   gates the dampening/baseline counters across restarts.
+- **One Neo4j per deployment (tenant isolation is an operator assumption).** The
+  construction queries MERGE `Resource`/`Agent`/`Session` purely on
+  `id`/`agent_id`/`session_id` with no tenant prefix and no DB uniqueness
+  constraints. Two deployments sharing one Neo4j instance would MERGE onto each
+  other's nodes and conflate scores (no cross-tenant injection — all Cypher is
+  parameterized — only score conflation under a shared-DB misconfiguration). Give
+  each deployment its own database/instance.
 
 What is sound by construction: no raw session content crosses the boundary (the
 snapshot is `id → float` only); all Cypher is parameterized; the hot-path enricher is
