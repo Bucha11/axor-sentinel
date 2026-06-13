@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from axor_sentinel.graph.model import SignalType
+from axor_sentinel.graph import construct
 from axor_sentinel.graph import queries as q
 from axor_sentinel.sentinel.events import (
     AgentContainerBaseline,
@@ -190,6 +191,20 @@ class SentinelCycle:
         now = time.time()
         scores = dict(resource_scores) if resource_scores else {}
         cmembers = dict(container_members) if container_members else {}
+
+        # Step 0 — materialise the graph for this cycle. The scoring Cypher below
+        # only reads/updates nodes; without this producer it matched an empty
+        # graph and did nothing. Upserts Agent/Session/Resource + ACCESSED/
+        # IN_SESSION and derives ADJACENT_TO from container co-membership so the
+        # caution and slow-and-low queries operate on real data. Runs before decay
+        # so freshly created nodes carry a current last_decay_at.
+        construct.upsert_graph(
+            self._neo4j,
+            sessions,
+            scores,
+            cmembers,
+            flag_threshold=FLAG_THRESHOLD,
+        )
 
         # Step 1 — apply time decay first (invariant A-4).
         # Decay is authoritative in Neo4j (correct last_decay_at per resource).

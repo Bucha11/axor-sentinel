@@ -28,7 +28,11 @@ import os
 
 import pytest
 
-from axor_sentinel.graph import queries as q
+import time
+
+from axor_sentinel.graph import construct, queries as q
+from axor_sentinel.graph.model import SignalType
+from axor_sentinel.sentinel.cycle import ResourceAccess, SentinelCycle, SessionSummary
 from axor_sentinel.sentinel.weight import accumulate
 
 # Skip the whole module unless the neo4j driver is installed.
@@ -317,3 +321,113 @@ class TestSlowAndLowDetection:
         )
         rows = q.slow_and_low_detection(session, min_gap_ms=DAY_MS)
         assert rows == []
+
+
+# ── Graph construction: the cycle now populates a real graph ───────────────────
+
+def _count(session, cypher: str) -> int:
+    return session.run(cypher).single()[0]
+
+
+def _access(rid: str, cid: str, sig: SignalType, conf: float = 1.0) -> ResourceAccess:
+    return ResourceAccess(
+        resource_id=rid, container_id=cid, canonical_confidence=conf, signal_type=sig
+    )
+
+
+def _summary(sid: str, agent: str, accesses, **kw) -> SessionSummary:
+    base = dict(
+        started_at=time.time(), had_taint=True, had_export_attempt=False,
+        had_failed_export=False, had_escalation=False,
+    )
+    base.update(kw)
+    return SessionSummary(
+        session_id=sid, agent_id=agent, accessed_resources=list(accesses), **base
+    )
+
+
+class TestGraphConstruction:
+    def test_upsert_creates_nodes_and_edges(self, session) -> None:
+        """upsert_graph materialises Agent/Session/Resource + ACCESSED/IN_SESSION."""
+        sess = _summary("cs1", "a1", [
+            _access("r1", "c1", SignalType.READ),
+            _access("r2", "c1", SignalType.READ_SUMMARIZE),
+        ])
+        construct.upsert_graph(
+            session, [sess], resource_scores={},
+            container_members={"c1": ["r1", "r2"]}, flag_threshold=FLAG_THRESHOLD,
+        )
+
+        assert _count(session, "MATCH (a:Agent {agent_id:'a1'}) RETURN count(a)") == 1
+        assert _count(session, "MATCH (s:Session {session_id:'cs1'}) RETURN count(s)") == 1
+        assert _count(session, "MATCH (:Resource) RETURN count(*)") == 2
+        assert _count(
+            session, "MATCH (:Agent)-[:IN_SESSION]->(:Session) RETURN count(*)"
+        ) == 1
+        assert _count(
+            session, "MATCH (:Session)-[:ACCESSED]->(:Resource) RETURN count(*)"
+        ) == 2
+        # ADJACENT_TO is symmetric between the two same-container resources.
+        assert _count(
+            session, "MATCH (:Resource)-[:ADJACENT_TO]->(:Resource) RETURN count(*)"
+        ) == 2
+        # canonical_confidence is set so the hot-weight Cypher matches Python.
+        rec = session.run(
+            "MATCH (r:Resource {id:'r2'}) RETURN r.canonical_confidence AS c"
+        ).single()
+        assert rec["c"] == pytest.approx(1.0)
+
+    def test_full_cycle_neo4j_matches_python_snapshot(self, session, tmp_path) -> None:
+        """With no adjacency (no caution), Neo4j score == the Python snapshot score."""
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
+        sess = _summary("cs1", "a1", [_access("r1", "c1", SignalType.READ_SUMMARIZE)])
+
+        snap = cycle.run_once([sess])   # no container_members → no ADJACENT_TO
+
+        py_score = snap.resource_reputation["r1"]
+        assert py_score > 0.0
+        assert _score(session, "r1") == pytest.approx(py_score)
+
+    def test_adjacency_makes_caution_propagate(self, session) -> None:
+        """A resource adjacent to a hot one (but not accessed) gets caution score."""
+        # r_old exists from a prior session so it can be an un-accessed neighbour.
+        old = _summary("s_old", "a1", [_access("r_old", "c1", SignalType.READ)],
+                       had_taint=False)
+        new = _summary("s_new", "a1", [_access("r_hot", "c1", SignalType.READ_SUMMARIZE)])
+        construct.upsert_graph(
+            session, [old, new], resource_scores={},
+            container_members={"c1": ["r_hot", "r_old"]}, flag_threshold=FLAG_THRESHOLD,
+        )
+
+        # Hot weight on the accessed resource, then caution on its neighbours.
+        q.apply_hot_weight(
+            session, session_id="s_new", signal_type="read_summarize",
+            raw_weight=0.6, flag_threshold=FLAG_THRESHOLD,
+        )
+        q.apply_caution_adjacent(session, session_id="s_new", flag_threshold=FLAG_THRESHOLD)
+
+        # r_old was not accessed by s_new but is ADJACENT_TO r_hot → caution > 0.
+        assert _score(session, "r_old") > 0.0
+
+    def test_full_cycle_enables_slow_and_low(self, session, tmp_path) -> None:
+        """A tainted-then-export staging pattern surfaces after a real cycle."""
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
+        now = time.time()
+        # Tainted session flags r1 (READ_EXPORT_FAILED → score 1.0).
+        tainted = _summary(
+            "s_taint", "a1", [_access("r1", "c1", SignalType.READ_EXPORT_FAILED)],
+            started_at=now,
+        )
+        # Later export session for the same agent (untainted — still materialised).
+        export = _summary(
+            "s_export", "a1", [], started_at=now + 5 * 86400,  # +5 days
+            had_taint=False, had_export_attempt=True,
+        )
+
+        cycle.run_once([tainted, export])
+
+        assert _flagged(session, "r1") is True
+        rows = q.slow_and_low_detection(session, min_gap_ms=DAY_MS)
+        assert len(rows) == 1
+        assert rows[0]["ag.agent_id"] == "a1"
+        assert rows[0]["flagged_resources"] == ["r1"]
