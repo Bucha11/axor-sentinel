@@ -8,11 +8,11 @@ and the ``ACCESSED`` / ``IN_SESSION`` edges the hot-weight and slow-and-low
 queries walk, and derives ``ADJACENT_TO`` edges (which nothing else writes) from
 container co-membership so the caution query is no longer inert.
 
-It runs before decay/hot-weight in ``SentinelCycle._run_once_locked``.  The
-in-memory Python path remains the snapshot source of truth for now (Neo4j read-
-back is a separate follow-up — see docs/deferred-followups.md item 1); this layer
-makes the graph real so the writes, caution and slow-and-low detection actually
-operate on something.
+It runs first (Step 0) in ``SentinelCycle._run_once_locked``, before decay and the
+hot-weight/caution writes.  Neo4j is the source of truth: the cycle reads the
+snapshot back from the graph after all writes (``RESOURCE_SCORES_QUERY``), so this
+producer is what makes the scores, caution and slow-and-low detection real rather
+than no-ops against an empty graph.
 """
 from __future__ import annotations
 
@@ -57,8 +57,7 @@ ON CREATE SET r.suspicion_score = acc.seed_score,
               r.flagged = (acc.seed_score >= $flag_threshold),
               r.last_decay_at = timestamp(),
               r.last_signal_at = timestamp()
-SET r.canonical_confidence = acc.canonical_confidence,
-    r.container_id = acc.container_id
+SET r.canonical_confidence = acc.canonical_confidence
 MERGE (s)-[a:ACCESSED {signal_type: acc.signal_type}]->(r)
 SET a.at = timestamp()
 """
@@ -110,7 +109,6 @@ def upsert_graph(
         accesses = [
             {
                 "resource_id": a.resource_id,
-                "container_id": a.container_id,
                 "canonical_confidence": a.canonical_confidence,
                 "signal_type": a.signal_type.value,
                 "seed_score": float(resource_scores.get(a.resource_id, 0.0)),

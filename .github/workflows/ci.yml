@@ -34,8 +34,8 @@ jobs:
           --health-start-period 30s
 
     env:
-      # Presence of this var un-skips tests/test_neo4j_cypher.py, which run the
-      # real Cypher against the neo4j service above. Unset locally → skipped.
+      # Presence of this var un-skips tests/test_neo4j_integration.py, which run the
+      # real Cypher + full cycle against the neo4j service above. Unset locally → skipped.
       AXOR_TEST_NEO4J_BOLT: bolt://localhost:7687
 
     steps:

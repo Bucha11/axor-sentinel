@@ -62,9 +62,29 @@ path was not merely lagging — it was **non-functional**:
   siblings — harmless while the snapshot was Python-built, a live bug once read back),
   and it returns before/after so `ReputationEvent` evidence is sourced from Neo4j too.
 
-**Residual:** `resource_scores` passed to `run_once` is now only a seed for brand-new
-resources (existing nodes persist in Neo4j); callers no longer need to thread scores
-back in. Per-spec topology grading (b) is still coarse. Both are minor.
+**Residual (surfaced by the step-3 review, all minor / non-wrong-deny):**
+- **Unbounded read-back.** `RESOURCE_SCORES_QUERY` returns every resource with
+  `score > 0`. Decay halves every 30 days and never reaches 0 in float, so resources
+  linger for months and the snapshot grows across cycles. Needs a periodic prune
+  (delete/forget resources below an epsilon) to bound snapshot size. The snapshot is a
+  full reputation map by design, so scoping the read-back to *this cycle* would be
+  wrong — pruning is the right lever.
+- **Coarse topology.** Same-container `ADJACENT_TO` is pinned at `topology_factor`
+  1.0; the per-spec 5-tier grade (same service 0.7, MCP namespace 0.6, …) and any
+  *cross*-container adjacency need container-type metadata the cycle isn't handed.
+  Adjacency is also re-derived and re-MERGEd every cycle though it is static topology
+  (`AdjacentToEdge` doc: "computed once on resource discovery") — make it incremental.
+- **Per-access round-trips.** Hot weight is one `apply_hot_weight` Bolt round-trip per
+  accessed resource. `FANOUT_WEIGHT_QUERY` already shows the batched `UNWIND` form;
+  a session touching N resources could collapse N round-trips into one.
+- **Event vs snapshot for fanout.** `ReputationEvent.score_after` is the post-hot,
+  *pre*-fanout score (sourced from the hot-weight `RETURN`); for a fanout-affected
+  resource the served snapshot score is higher. Intentional (the FanoutSignal carries
+  the fanout evidence), but a consumer correlating the two sees different numbers.
+- **Seed-only `resource_scores`.** The `run_once` arg now only seeds brand-new
+  resources (existing nodes persist in Neo4j); the forward-integration docstrings in
+  `integration/` still show the old "thread scores back in" call shape. Harmless
+  (those sinks have no producer yet) but should be refreshed when they go live.
 
 ## 2. Cycle concurrency & crash-consistency — DONE (see Status)
 
