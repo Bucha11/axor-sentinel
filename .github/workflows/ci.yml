@@ -17,6 +17,21 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
 
+    # A throwaway Neo4j so the live graph tests (Cypher EXPLAIN parse-guard + the
+    # read-back equivalence checks) actually run in CI instead of skipping. Auth is
+    # disabled — it holds only ephemeral test data.
+    services:
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: none
+        ports:
+          - 7687:7687
+          - 7474:7474
+
+    env:
+      AXOR_TEST_NEO4J_BOLT: bolt://localhost:7687
+
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +63,28 @@ jobs:
 
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -e ".[dev,neo4j]"
+
+      - name: Wait for Neo4j
+        run: |
+          python - << 'EOF'
+          import time
+          from neo4j import GraphDatabase
+          d = GraphDatabase.driver("bolt://localhost:7687")
+          for _ in range(60):
+              try:
+                  d.verify_connectivity()
+                  with d.session() as s:
+                      s.run("RETURN 1").consume()
+                  print("Neo4j ready")
+                  break
+              except Exception as e:
+                  print("waiting for Neo4j:", e)
+                  time.sleep(2)
+          else:
+              raise SystemExit("Neo4j did not become ready")
+          d.close()
+          EOF
 
       - name: Static analysis — no axor-sentinel imports in axor-core
         run: |
