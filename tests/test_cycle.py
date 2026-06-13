@@ -416,3 +416,97 @@ class TestCrashConsistencyAndLocking:
         assert seen["locked_during"] is True          # held across the cycle body
         assert cycle._lock.acquire(blocking=False)     # released afterwards
         cycle._lock.release()
+
+
+# ── _dedupe_sessions: collapse records that share a session_id ────────────────
+
+def _summary(
+    session_id: str,
+    *,
+    agent_id: str = "a",
+    had_taint: bool = True,
+    had_export: bool = False,
+    had_escalation: bool = False,
+    resources: list[tuple[str, str, float, SignalType]] | None = None,
+    taint_source: str = "mcp",
+    source_class: str = "",
+    started_at: float = 100.0,
+) -> SessionSummary:
+    accesses = [
+        ResourceAccess(resource_id=r, container_id=c, canonical_confidence=conf, signal_type=sig)
+        for r, c, conf, sig in (resources or [])
+    ]
+    return SessionSummary(
+        session_id=session_id,
+        agent_id=agent_id,
+        started_at=started_at,
+        had_taint=had_taint,
+        had_export_attempt=had_export,
+        had_failed_export=False,
+        had_escalation=had_escalation,
+        accessed_resources=accesses,
+        taint_source=taint_source,
+        source_class=source_class,
+    )
+
+
+class TestDedupeSessions:
+    def test_distinct_session_ids_preserved_in_order(self) -> None:
+        a = _summary("s1", resources=[("r1", "c1", 1.0, SignalType.READ)])
+        b = _summary("s2", resources=[("r2", "c2", 1.0, SignalType.READ)])
+        out = SentinelCycle._dedupe_sessions([a, b])
+        assert [s.session_id for s in out] == ["s1", "s2"]
+
+    def test_same_session_id_merges_union_of_evidence(self) -> None:
+        # mirrors core-derived record + axor-probe drift buffer for one session
+        core = _summary(
+            "s1", resources=[("r1", "c1", 1.0, SignalType.READ)],
+            taint_source="mcp", source_class="tool:fs", started_at=100.0,
+        )
+        probe = _summary(
+            "s1", resources=[], had_escalation=True,
+            taint_source="behavioral_drift", source_class="", started_at=50.0,
+        )
+        out = SentinelCycle._dedupe_sessions([core, probe])
+        assert len(out) == 1
+        m = out[0]
+        assert m.had_taint is True
+        assert m.had_escalation is True            # OR-ed in from the probe record
+        assert m.started_at == 50.0               # earliest
+        assert m.source_class == "tool:fs"        # first attested value kept
+        assert m.taint_source == "mcp"            # first wins (descriptive only)
+        assert [a.resource_id for a in m.accessed_resources] == ["r1"]
+
+    def test_repeated_access_not_double_counted(self) -> None:
+        a = _summary("s1", resources=[("r1", "c1", 1.0, SignalType.READ)])
+        b = _summary("s1", resources=[
+            ("r1", "c1", 1.0, SignalType.READ),       # duplicate of a's access
+            ("r2", "c2", 1.0, SignalType.READ),
+        ])
+        out = SentinelCycle._dedupe_sessions([a, b])
+        ids = sorted(x.resource_id for x in out[0].accessed_resources)
+        assert ids == ["r1", "r2"]                 # r1 appears once, not twice
+
+    def test_later_record_can_attest_source_class(self) -> None:
+        a = _summary("s1", source_class="")
+        b = _summary("s1", source_class="tool:fs")
+        out = SentinelCycle._dedupe_sessions([a, b])
+        assert out[0].source_class == "tool:fs"
+
+    def test_inputs_are_not_mutated(self) -> None:
+        a = _summary("s1", resources=[("r1", "c1", 1.0, SignalType.READ)])
+        b = _summary("s1", resources=[("r2", "c2", 1.0, SignalType.READ)], had_escalation=True)
+        SentinelCycle._dedupe_sessions([a, b])
+        assert len(a.accessed_resources) == 1      # caller's list untouched
+        assert a.had_escalation is False
+
+
+def test_run_once_dedupes_duplicate_session(tmp_path: Path) -> None:
+    """A session_id present twice in one cycle is counted once for dampening."""
+    cycle, _neo4j = _cycle(tmp_path)
+    sess = _summary("s1", agent_id="a", resources=[("r1", "c1", 1.0, SignalType.READ)])
+    dup = _summary("s1", agent_id="a", resources=[("r1", "c1", 1.0, SignalType.READ)])
+    cycle.run_once([sess, dup])
+    # origin = source_class or agent_id = "a"; the dampening counter for (r1, a)
+    # must increment once — without dedup the duplicate would push it to 2.
+    assert cycle._prior_counts[("r1", "a")] == 1

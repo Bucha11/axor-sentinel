@@ -179,6 +179,56 @@ class SentinelCycle:
         with self._lock:
             return self._run_once_locked(sessions, resource_scores, container_members)
 
+    @staticmethod
+    def _dedupe_sessions(sessions: list[SessionSummary]) -> list[SessionSummary]:
+        """Collapse records that share a session_id into a single merged record.
+
+        The caller assembles one cycle's sessions from several sources — e.g. the
+        core-derived list plus axor-probe's behavioral-drift buffer
+        (ProbeTaintBridge.drain_pending()). The same session_id can therefore
+        appear more than once. Processing it twice would double-count fanout and
+        caution writes and double-increment the dampening / diversity counters,
+        so the records are merged before anything reads them.
+
+        Merge is order-preserving (first occurrence keeps the slot) and is a
+        union of evidence: boolean flags OR together, accessed_resources union
+        (deduped by resource_id + container_id + signal_type so a repeated access
+        is not weighted twice), started_at is the earliest, and source_class is
+        taken from the first record that attests one. taint_source keeps the
+        first value — it is descriptive evidence only; the poisoning-mitigation
+        factors key on the actor origin, not this label (F1).
+
+        Input records are not mutated.
+        """
+        merged: dict[str, SessionSummary] = {}
+        order: list[str] = []
+        for s in sessions:
+            existing = merged.get(s.session_id)
+            if existing is None:
+                merged[s.session_id] = dataclasses.replace(
+                    s, accessed_resources=list(s.accessed_resources)
+                )
+                order.append(s.session_id)
+                continue
+            seen = {
+                (a.resource_id, a.container_id, a.signal_type)
+                for a in existing.accessed_resources
+            }
+            existing.accessed_resources.extend(
+                a for a in s.accessed_resources
+                if (a.resource_id, a.container_id, a.signal_type) not in seen
+            )
+            existing.had_taint = existing.had_taint or s.had_taint
+            existing.had_export_attempt = existing.had_export_attempt or s.had_export_attempt
+            existing.had_failed_export = existing.had_failed_export or s.had_failed_export
+            existing.had_escalation = existing.had_escalation or s.had_escalation
+            existing.started_at = min(existing.started_at, s.started_at)
+            if not existing.source_class and s.source_class:
+                existing.source_class = s.source_class
+            if not existing.agent_id and s.agent_id:
+                existing.agent_id = s.agent_id
+        return [merged[sid] for sid in order]
+
     def _run_once_locked(
         self,
         sessions: list[SessionSummary],
@@ -186,6 +236,10 @@ class SentinelCycle:
         container_members: dict[str, list[str]] | None,
     ) -> ReputationSnapshot:
         now = time.time()
+        # Collapse records that share a session_id (e.g. the core-derived list
+        # merged with axor-probe's drift buffer) so one session is never
+        # double-counted in fanout, caution, or the dampening counters.
+        sessions = self._dedupe_sessions(sessions)
         # seed_scores only seeds BRAND-NEW Resource nodes (construct's ON CREATE);
         # existing nodes keep their persisted Neo4j score. Neo4j is authoritative —
         # the snapshot is read back from it at the end, not re-accumulated here.
