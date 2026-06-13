@@ -61,6 +61,38 @@ def test_query_parses_on_real_neo4j(session, name):
     session.run("EXPLAIN " + getattr(q, name), **_EXPLAIN_PARAMS[name]).consume()
 
 
+def test_upsert_builds_graph_and_read_back_matches_accumulate(session):
+    # The construction layer must build the graph the weight queries MATCH against,
+    # and read_resource_scores must return the authoritative accumulated scores.
+    from axor_sentinel.graph.model import SignalType
+    from axor_sentinel.sentinel.weight import compute_hot_weight
+
+    session.run("MATCH (n) DETACH DELETE n")
+    accesses = [
+        {"resource_id": "r1", "canonical_confidence": 1.0, "signal_type": SignalType.READ.value},
+        {"resource_id": "r2", "canonical_confidence": 0.7, "signal_type": SignalType.READ_EXPORT_FAILED.value},
+    ]
+    q.upsert_session(
+        session, agent_id="agentA", session_id="s1", had_taint=True,
+        had_export_attempt=False, started_at=1000.0, accesses=accesses,
+    )
+    built = session.run(
+        "MATCH (a:Agent)-[:IN_SESSION]->(:Session)-[:ACCESSED]->(r:Resource) RETURN count(r) AS c"
+    ).single()["c"]
+    assert built == 2
+
+    q.apply_decay(session, flag_threshold=0.7)
+    for acc in accesses:
+        raw = compute_hot_weight(SignalType(acc["signal_type"]))
+        q.apply_hot_weight(
+            session, session_id="s1", signal_type=acc["signal_type"],
+            raw_weight=raw, flag_threshold=0.7,
+        )
+    scores = q.read_resource_scores(session)
+    assert scores["r1"] == pytest.approx(accumulate(0.0, compute_hot_weight(SignalType.READ) * 1.0))
+    assert scores["r2"] == pytest.approx(accumulate(0.0, compute_hot_weight(SignalType.READ_EXPORT_FAILED) * 0.7))
+
+
 def test_hot_weight_and_fanout_match_python_accumulate(session):
     session.run("MATCH (n) DETACH DELETE n")
     session.run(

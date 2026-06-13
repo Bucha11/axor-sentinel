@@ -85,8 +85,70 @@ RETURN ag.agent_id,
 ORDER BY gap_days DESC
 """
 
+# Build/refresh the graph structure for one session before the weight queries run.
+# This is the construction layer the weight/decay/detection queries MATCH against —
+# without it they have nothing to act on. A Resource keeps its accumulated
+# suspicion_score across cycles (ON CREATE seeds it to 0); canonical_confidence is
+# refreshed each access. last_decay_at is set on create so DECAY_QUERY has a base.
+UPSERT_SESSION_QUERY = """
+MERGE (ag:Agent {agent_id: $agent_id})
+MERGE (s:Session {session_id: $session_id})
+  SET s.had_taint = $had_taint,
+      s.had_export_attempt = $had_export_attempt,
+      s.started_at = $started_at
+MERGE (ag)-[:IN_SESSION]->(s)
+WITH s
+UNWIND $accesses AS acc
+MERGE (r:Resource {id: acc.resource_id})
+  ON CREATE SET r.suspicion_score = 0.0,
+                r.flagged = false,
+                r.last_decay_at = timestamp(),
+                r.last_signal_at = timestamp()
+  SET r.canonical_confidence = acc.canonical_confidence
+MERGE (s)-[:ACCESSED {signal_type: acc.signal_type}]->(r)
+"""
+
+# Read the authoritative resource scores back after all writes — the source for the
+# snapshot when Neo4j is the system of record.
+READ_RESOURCE_SCORES_QUERY = """
+MATCH (r:Resource)
+RETURN r.id AS id, r.suspicion_score AS score, r.flagged AS flagged
+"""
+
 
 # ── Query runner functions ─────────────────────────────────────────────────────
+
+def upsert_session(
+    session: Any,
+    *,
+    agent_id: str,
+    session_id: str,
+    had_taint: bool,
+    had_export_attempt: bool,
+    started_at: float,
+    accesses: list[dict],
+) -> None:
+    """Create/refresh the Agent/Session/Resource nodes and ACCESSED/IN_SESSION edges
+    for one session, so the weight/decay/detection queries have a graph to act on.
+
+    ``accesses`` is a list of ``{"resource_id", "canonical_confidence", "signal_type"}``.
+    """
+    session.run(
+        UPSERT_SESSION_QUERY,
+        agent_id=agent_id,
+        session_id=session_id,
+        had_taint=had_taint,
+        had_export_attempt=had_export_attempt,
+        started_at=started_at,
+        accesses=accesses,
+    )
+
+
+def read_resource_scores(session: Any) -> dict[str, float]:
+    """Read all resource suspicion scores back from Neo4j (the authoritative store)."""
+    result = session.run(READ_RESOURCE_SCORES_QUERY)
+    return {row["id"]: row["score"] for row in result}
+
 
 def apply_decay(session: Any, flag_threshold: float) -> None:
     """
