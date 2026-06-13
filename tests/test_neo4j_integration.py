@@ -104,9 +104,10 @@ def _flagged(session, rid: str) -> bool:
 _EXPLAIN_PARAMS = {
     "DECAY_QUERY": {"flag_threshold": 0.7},
     "HOT_WEIGHT_QUERY": {
-        "session_id": "x", "signal_type": "read",
+        "session_id": "x", "signal_type": "read", "resource_id": "r1",
         "raw_weight": 0.4, "flag_threshold": 0.7,
     },
+    "RESOURCE_SCORES_QUERY": {},
     "CAUTION_ADJACENT_QUERY": {"session_id": "x", "flag_threshold": 0.7},
     "FANOUT_WEIGHT_QUERY": {
         "resource_ids": ["r1"], "fanout_weight": 0.5, "flag_threshold": 0.7,
@@ -131,15 +132,16 @@ def test_hot_weight_and_fanout_match_python_accumulate(session) -> None:
         "MERGE (sn)-[:ACCESSED {signal_type:'read'}]->(r)"
     )
 
-    q.apply_hot_weight(
+    before, after = q.apply_hot_weight(
         session, session_id="s1", signal_type="read",
-        raw_weight=0.4, flag_threshold=FLAG_THRESHOLD,
+        raw_weight=0.4, flag_threshold=FLAG_THRESHOLD, resource_id="r1",
     )
+    assert (before, after) == pytest.approx((0.0, accumulate(0.0, 0.4)))
     assert _score(session, "r1") == pytest.approx(accumulate(0.0, 0.4))
 
     q.apply_hot_weight(
         session, session_id="s1", signal_type="read",
-        raw_weight=0.4, flag_threshold=FLAG_THRESHOLD,
+        raw_weight=0.4, flag_threshold=FLAG_THRESHOLD, resource_id="r1",
     )
     q.apply_fanout_weight(
         session, resource_ids=["r1"], fanout_weight=0.5, flag_threshold=FLAG_THRESHOLD,
@@ -215,9 +217,36 @@ class TestHotWeightQuery:
             signal_type="READ_SUMMARIZE",
             raw_weight=0.6,
             flag_threshold=FLAG_THRESHOLD,
+            resource_id="r_hot",
         )
 
         assert _score(session, "r_hot") == pytest.approx(0.6)
+
+    def test_hot_weight_targets_only_its_resource(self, session) -> None:
+        """Two resources share one signal_type; each call must hit only its own.
+
+        Before the id filter, the signal_type-wide MATCH double-counted every
+        sibling on each per-resource call — now a live bug since scores are read
+        back into the snapshot.
+        """
+        session.run(
+            """
+            CREATE (s:Session {session_id: 's_multi', had_taint: true})
+            CREATE (a:Resource {id: 'r_a', suspicion_score: 0.0, canonical_confidence: 1.0,
+                                flagged: false, last_decay_at: timestamp(), last_signal_at: timestamp()})
+            CREATE (b:Resource {id: 'r_b', suspicion_score: 0.0, canonical_confidence: 1.0,
+                                flagged: false, last_decay_at: timestamp(), last_signal_at: timestamp()})
+            CREATE (s)-[:ACCESSED {signal_type: 'READ'}]->(a)
+            CREATE (s)-[:ACCESSED {signal_type: 'READ'}]->(b)
+            """
+        )
+        q.apply_hot_weight(
+            session, session_id="s_multi", signal_type="READ",
+            raw_weight=0.6, flag_threshold=FLAG_THRESHOLD, resource_id="r_a",
+        )
+        # r_a got the weight exactly once; r_b (same signal_type) is untouched.
+        assert _score(session, "r_a") == pytest.approx(0.6)
+        assert _score(session, "r_b") == 0.0
 
     def test_hot_weight_ignores_untainted_session(self, session) -> None:
         """The MATCH requires had_taint:true — untainted sessions are no-ops."""
@@ -231,13 +260,15 @@ class TestHotWeightQuery:
             CREATE (s)-[:ACCESSED {signal_type: 'READ'}]->(r)
             """
         )
-        q.apply_hot_weight(
+        result = q.apply_hot_weight(
             session,
             session_id="s_clean",
             signal_type="READ",
             raw_weight=0.6,
             flag_threshold=FLAG_THRESHOLD,
+            resource_id="r_clean",
         )
+        assert result is None   # no match → nothing applied
         assert _score(session, "r_clean") == 0.0
 
 
@@ -377,17 +408,6 @@ class TestGraphConstruction:
         ).single()
         assert rec["c"] == pytest.approx(1.0)
 
-    def test_full_cycle_neo4j_matches_python_snapshot(self, session, tmp_path) -> None:
-        """With no adjacency (no caution), Neo4j score == the Python snapshot score."""
-        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
-        sess = _summary("cs1", "a1", [_access("r1", "c1", SignalType.READ_SUMMARIZE)])
-
-        snap = cycle.run_once([sess])   # no container_members → no ADJACENT_TO
-
-        py_score = snap.resource_reputation["r1"]
-        assert py_score > 0.0
-        assert _score(session, "r1") == pytest.approx(py_score)
-
     def test_adjacency_makes_caution_propagate(self, session) -> None:
         """A resource adjacent to a hot one (but not accessed) gets caution score."""
         # r_old exists from a prior session so it can be an un-accessed neighbour.
@@ -402,7 +422,7 @@ class TestGraphConstruction:
         # Hot weight on the accessed resource, then caution on its neighbours.
         q.apply_hot_weight(
             session, session_id="s_new", signal_type="read_summarize",
-            raw_weight=0.6, flag_threshold=FLAG_THRESHOLD,
+            raw_weight=0.6, flag_threshold=FLAG_THRESHOLD, resource_id="r_hot",
         )
         q.apply_caution_adjacent(session, session_id="s_new", flag_threshold=FLAG_THRESHOLD)
 
@@ -431,3 +451,105 @@ class TestGraphConstruction:
         assert len(rows) == 1
         assert rows[0]["ag.agent_id"] == "a1"
         assert rows[0]["flagged_resources"] == ["r1"]
+
+
+# ── Full cycle: the snapshot is read back from Neo4j (authoritative store) ──────
+
+class TestFullCycleSnapshot:
+    """run_once builds the snapshot from Neo4j, not an in-memory re-accumulation.
+
+    These replace the old mock-based snapshot-score tests in test_cycle.py: with
+    Neo4j authoritative, only a live server can assert the resulting magnitudes.
+    """
+
+    def test_snapshot_reflects_neo4j_score(self, session, tmp_path) -> None:
+        """The snapshot score for a resource equals its Neo4j suspicion_score."""
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
+        sess = _summary("cs1", "a1", [_access("r1", "c1", SignalType.READ_SUMMARIZE)])
+
+        snap = cycle.run_once([sess])
+
+        assert snap.resource_reputation["r1"] > 0.0
+        assert snap.resource_reputation["r1"] == pytest.approx(_score(session, "r1"))
+
+    def test_untainted_session_leaves_score_at_zero(self, session, tmp_path) -> None:
+        """An untainted session creates the node but applies no weight → absent (0)."""
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
+        sess = _summary("cs1", "a1", [_access("r1", "c1", SignalType.READ)],
+                        had_taint=False)
+
+        snap = cycle.run_once([sess])
+
+        # Score 0 → excluded from the read-back, so the consumer sees 0.
+        assert snap.resource_reputation.get("r1", 0.0) == 0.0
+
+    def test_higher_signal_type_produces_higher_score(self, session, tmp_path) -> None:
+        """READ_EXPORT_FAILED accrues more than READ-only across two cycles."""
+        c_read = SentinelCycle(session, tmp_path / "read", agent_baselines={})
+        snap_read = c_read.run_once(
+            [_summary("s_r", "a", [_access("rr", "c", SignalType.READ)])]
+        )
+        session.run("MATCH (n) DETACH DELETE n")   # isolate the two cycles
+        c_fail = SentinelCycle(session, tmp_path / "fail", agent_baselines={})
+        snap_fail = c_fail.run_once(
+            [_summary("s_f", "a", [_access("rr", "c", SignalType.READ_EXPORT_FAILED)])]
+        )
+
+        assert snap_fail.resource_reputation["rr"] > snap_read.resource_reputation["rr"]
+
+    def test_container_scores_populated(self, session, tmp_path) -> None:
+        """Container aggregation is computed from the read-back resource scores."""
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
+        sess = _summary("cs1", "a1", [_access("r1", "c1", SignalType.READ_EXPORT_FAILED)])
+
+        snap = cycle.run_once([sess], container_members={"c1": ["r1"]})
+
+        assert snap.container_reputation["c1"] > 0.0
+
+    def test_caution_is_reflected_in_snapshot(self, session, tmp_path) -> None:
+        """The key win: caution (graph-only before) now lands in the snapshot.
+
+        Cycle 1 seeds an un-accessed neighbour; cycle 2 accesses its same-container
+        sibling in a tainted session, so caution flows to the neighbour AND shows up
+        in the served snapshot — previously invisible because the snapshot came from
+        the Python path, which never computed caution.
+        """
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
+        members = {"c1": ["r_hot", "r_quiet"]}
+        # Cycle 1: r_quiet becomes a known node (untainted, stays at 0).
+        cycle.run_once(
+            [_summary("s1", "a1", [_access("r_quiet", "c1", SignalType.READ)],
+                      had_taint=False)],
+            container_members=members,
+        )
+        # Cycle 2: tainted access to r_hot; r_quiet is adjacent but not accessed.
+        snap = cycle.run_once(
+            [_summary("s2", "a1", [_access("r_hot", "c1", SignalType.READ_SUMMARIZE)])],
+            container_members=members,
+        )
+
+        assert snap.resource_reputation["r_hot"] > 0.0
+        # Caution reached the neighbour and is visible in the snapshot.
+        assert snap.resource_reputation.get("r_quiet", 0.0) > 0.0
+        assert snap.resource_reputation["r_quiet"] == pytest.approx(
+            _score(session, "r_quiet")
+        )
+
+    def test_fanout_boost_in_snapshot(self, session, tmp_path) -> None:
+        """A fired fanout adds FANOUT_WEIGHT on top of the hot weight in the snapshot."""
+        from axor_sentinel.sentinel.events import AgentContainerBaseline
+        from axor_sentinel.sentinel.cycle import FANOUT_MIN_SESSIONS
+
+        agent = "fan"
+        baseline = AgentContainerBaseline(
+            agent_id=agent, mean_containers_per_session=1.0,
+            std_containers_per_session=0.5, session_count=FANOUT_MIN_SESSIONS,
+            last_updated=0.0,
+        )
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={agent: baseline})
+        # 10 unique containers → z = (10 - 1.0) / 0.5 = 18 >> 2.5 → fanout fires.
+        accesses = [_access(f"r{i}", f"c{i}", SignalType.READ_SUMMARIZE) for i in range(10)]
+        snap = cycle.run_once([_summary("s_fan", agent, accesses)])
+
+        # READ_SUMMARIZE hot weight alone ≈ 0.6; with fanout 0.5 on top → ≈ 0.8.
+        assert snap.resource_reputation["r0"] > 0.6

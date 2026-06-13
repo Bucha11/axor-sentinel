@@ -244,6 +244,11 @@ Applied as a **separate** `accumulate()` call, not folded into `effective_weight
 `SentinelCycle.run_once()` in `sentinel/cycle.py`. Runs in the background (~1h interval), not in the hot path.
 
 ```
+0. Graph construction   → construct.upsert_graph: MERGE Agent/Session/Resource +
+                          ACCESSED/IN_SESSION for every session; derive ADJACENT_TO
+                          from container co-membership. The scoring Cypher below only
+                          reads/updates nodes, so this producer must run first.
+
 1. DECAY_QUERY           → Neo4j: decay all resources with non-zero score
                                    update last_decay_at; leave last_signal_at unchanged
 
@@ -255,17 +260,19 @@ Applied as a **separate** `accumulate()` call, not folded into `effective_weight
                           z > 2.5 → emit FanoutSignal
 
    b. Hot weights       → per accessed resource:
-                          compute effective_weight
-                          accumulate in-memory score
-                          if fanout: accumulate(score, 0.5) separately (A-10)
-                          HOT_WEIGHT_QUERY → Neo4j (passes raw×diversity×dampening;
-                          Cypher multiplies by canonical_confidence — A-8)
-                          record ReputationEvent
+                          compute raw×diversity×dampening pre-scale
+                          HOT_WEIGHT_QUERY → Neo4j (Cypher accumulates and multiplies
+                          by canonical_confidence — A-8); returns before/after
+                          record ReputationEvent from the returned scores
+                          if fanout: FANOUT_WEIGHT_QUERY adds 0.5 separately (A-10)
 
    c. Caution weights   → CAUTION_ADJACENT_QUERY → Neo4j
                           (adjacent resources not directly accessed)
 
-3. Container scores     → recompute for all affected containers
+3. Read back            → RESOURCE_SCORES_QUERY: Neo4j is authoritative — the snapshot
+                          scores (incl. decay, fanout AND caution) are read from the
+                          graph, not re-accumulated in Python
+   Container scores     → recompute from the read-back scores (A-9)
 
 4. Snapshot swap        → ReputationSnapshot.with_checksum()
                           atomic_swap(snapshot_dir, snapshot)   ← A-5, A-16

@@ -27,7 +27,6 @@ from axor_sentinel.sentinel.snapshot import (
 )
 from axor_sentinel.sentinel.weight import (
     FLAG_THRESHOLD,
-    accumulate,
     compute_weight_factors,
     compute_hot_weight,
     compute_container_score,
@@ -131,10 +130,6 @@ class SentinelCycle:
         # _baselines / _current_version, none of which is safe under overlap.
         self._lock = threading.Lock()
 
-        # In-memory resource scores (updated during a cycle, then snapshot-written)
-        self._resource_scores: dict[str, float] = {}
-        self._container_member_map: dict[str, list[str]] = {}  # container_id → [resource_ids]
-
         # If explicit state is provided (tests / controlled init), use it directly.
         # Otherwise try to restore persisted state from disk so poisoning-mitigation
         # counters and agent baselines survive process restarts.
@@ -170,7 +165,9 @@ class SentinelCycle:
 
         Args:
             sessions:          completed sessions since last audit
-            resource_scores:   current resource_id → score (mutated in-place)
+            resource_scores:   optional seeds for brand-new resources only; Neo4j is
+                               authoritative for resources it already knows, and the
+                               snapshot is read back from it (not from this dict)
             container_members: container_id → [resource_ids] for aggregation
 
         Returns:
@@ -189,7 +186,10 @@ class SentinelCycle:
         container_members: dict[str, list[str]] | None,
     ) -> ReputationSnapshot:
         now = time.time()
-        scores = dict(resource_scores) if resource_scores else {}
+        # seed_scores only seeds BRAND-NEW Resource nodes (construct's ON CREATE);
+        # existing nodes keep their persisted Neo4j score. Neo4j is authoritative —
+        # the snapshot is read back from it at the end, not re-accumulated here.
+        seed_scores = dict(resource_scores) if resource_scores else {}
         cmembers = dict(container_members) if container_members else {}
 
         # Step 0 — materialise the graph for this cycle. The scoring Cypher below
@@ -201,15 +201,14 @@ class SentinelCycle:
         construct.upsert_graph(
             self._neo4j,
             sessions,
-            scores,
+            seed_scores,
             cmembers,
             flag_threshold=FLAG_THRESHOLD,
         )
 
-        # Step 1 — apply time decay first (invariant A-4).
-        # Decay is authoritative in Neo4j (correct last_decay_at per resource).
-        # resource_scores passed by caller should be current Neo4j-authoritative values;
-        # no additional in-memory decay is applied here to avoid A-3 violations.
+        # Step 1 — apply time decay first (invariant A-4). Decay runs entirely in
+        # Neo4j against each resource's own last_decay_at; no in-memory decay exists
+        # to drift from it or to risk an A-3 violation.
         q.apply_decay(self._neo4j, flag_threshold=FLAG_THRESHOLD)
 
         self._reputation_events.clear()
@@ -248,43 +247,42 @@ class SentinelCycle:
                 )
                 eff_weight = wf.effective
 
-                score_before = scores.get(rid, 0.0)
-                score_after = accumulate(score_before, eff_weight)
-
-                # A-10: fanout flat 0.5 applied as a SEPARATE accumulate call
-                if fanout is not None and rid in fanout.affected_resources:
-                    score_after = accumulate(score_after, FANOUT_WEIGHT)
-
-                scores[rid] = score_after
-
-                # Mirror to Neo4j (next-cycle authoritative store). The hot-weight
-                # Cypher multiplies $raw_weight by r.canonical_confidence, so we hand
-                # it wf.without_confidence (raw * diversity * dampening).
-                q.apply_hot_weight(
+                # Apply the hot weight in Neo4j (the authoritative store) and take
+                # the before/after score straight from it — no parallel in-memory
+                # accumulate to drift from. The Cypher multiplies $raw_weight by
+                # r.canonical_confidence, so we hand it wf.without_confidence
+                # (raw * diversity * dampening). The fanout flat weight is applied
+                # separately below (A-10) and lands in the read-back snapshot.
+                result = q.apply_hot_weight(
                     self._neo4j,
                     session_id=session.session_id,
                     signal_type=access.signal_type.value,
                     raw_weight=wf.without_confidence,
                     flag_threshold=FLAG_THRESHOLD,
+                    resource_id=rid,
                 )
 
-                # Record evidence
-                event = ReputationEvent.create(
-                    resource_id=rid,
-                    session_id=session.session_id,
-                    taint_source=session.taint_source,
-                    signal_type=access.signal_type.value,
-                    raw_weight=raw_weight,
-                    effective_weight=eff_weight,
-                    score_before=score_before,
-                    score_after=score_after,
-                    reason=(
-                        f"hot signal {access.signal_type.value} "
-                        f"from tainted session {session.session_id}"
-                    ),
-                    timestamp=now,
-                )
-                self._reputation_events.append(event)
+                # Record evidence when the write matched (real graph). score_after
+                # is the post-hot value; the fanout contribution is evidenced by the
+                # FanoutSignal, not folded into this per-signal event.
+                if result is not None:
+                    score_before, score_after = result
+                    event = ReputationEvent.create(
+                        resource_id=rid,
+                        session_id=session.session_id,
+                        taint_source=session.taint_source,
+                        signal_type=access.signal_type.value,
+                        raw_weight=raw_weight,
+                        effective_weight=eff_weight,
+                        score_before=score_before,
+                        score_after=score_after,
+                        reason=(
+                            f"hot signal {access.signal_type.value} "
+                            f"from tainted session {session.session_id}"
+                        ),
+                        timestamp=now,
+                    )
+                    self._reputation_events.append(event)
 
                 # Update signal history and prior counts — keyed on the actor origin
                 # (see `origin` above), so source-label rotation cannot reset them.
@@ -293,8 +291,8 @@ class SentinelCycle:
                 self._prior_counts[key] = self._prior_counts.get(key, 0) + 1
 
             # 2d(fanout) — write fanout flat weight to Neo4j (invariant A-10).
-            # The in-memory scores already include the fanout boost (applied above).
-            # This call keeps the graph in sync so the next cycle reads correct values.
+            # Applied as a separate accumulate on top of the hot weights; it lands
+            # in the read-back snapshot below since that reads Neo4j after all writes.
             if fanout is not None:
                 q.apply_fanout_weight(
                     self._neo4j,
@@ -310,10 +308,15 @@ class SentinelCycle:
                 flag_threshold=FLAG_THRESHOLD,
             )
 
-        # 2f — recompute container scores
+        # Read scores back from Neo4j — the authoritative store. This is what folds
+        # decay, hot weights, the fanout boost AND caution (which is written only to
+        # the graph, never computed in Python) into one consistent snapshot.
+        final_scores = q.read_resource_scores(self._neo4j)
+
+        # 2f — recompute container scores from the read-back scores (invariant A-9).
         container_scores: dict[str, float] = {}
         for cid, member_ids in cmembers.items():
-            member_scores = [scores.get(rid, 0.0) for rid in member_ids]
+            member_scores = [final_scores.get(rid, 0.0) for rid in member_ids]
             container_scores[cid] = compute_container_score(member_scores)
 
         # Step 3 — write the new snapshot (invariant A-5).
@@ -321,7 +324,7 @@ class SentinelCycle:
         snapshot = ReputationSnapshot(
             version=self._current_version,
             generated_at=now,
-            resource_reputation=scores,
+            resource_reputation=final_scores,
             container_reputation=container_scores,
         ).with_checksum()
 
@@ -336,7 +339,7 @@ class SentinelCycle:
         log.info(
             "sentinel cycle complete: version=%d resources=%d containers=%d events=%d",
             self._current_version,
-            len(scores),
+            len(final_scores),
             len(container_scores),
             len(self._reputation_events),
         )
