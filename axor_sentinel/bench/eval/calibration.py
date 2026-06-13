@@ -1,11 +1,14 @@
-"""Threshold calibration for the reputation gate.
+"""Threshold calibration for the suspicion flag threshold.
 
-The Phase-1 deterministic deny in axor-core fires at a *fixed*
-REPUTATION_RULE_THRESHOLD (0.8). That constant is only defensible if it has a
-measured false-positive rate on representative data. This module turns a labeled
-scenario set + per-scenario scores into a full ROC / PR curve, AUCs, and a
-threshold selected for a target FPR — i.e. it replaces a guessed constant with a
-data-derived one.
+Sentinel flags a resource when its *suspicion* score crosses ``FLAG_THRESHOLD``
+(default 0.7). Reputation feeds axor-core as OBSERVE-ONLY telemetry — core does not
+deny on it; it can, opt-in, tighten degradation when the converted reputation
+crosses ``detection_floor`` (and ``detection_floor = 1 - flag_threshold``). Either
+way the flag/floor threshold is only defensible if it has a measured false-positive
+rate on representative data. This module turns a labeled scenario set + per-scenario
+suspicion scores into a full ROC / PR curve, AUCs, and a threshold selected for a
+target FPR — replacing a guessed constant with a data-derived one. The selected
+suspicion threshold maps to a core floor of ``1 - selected_threshold``.
 
 The math here is exact and unit-tested. The *quality* of the calibration is only
 as good as the input dataset: feeding the synthetic bench set gives a synthetic
@@ -16,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Sequence
+
+from axor_sentinel.sentinel.weight import FLAG_THRESHOLD
 
 if TYPE_CHECKING:
     from axor_sentinel.bench.dataset.schema import Scenario
@@ -40,8 +45,9 @@ class CalibrationReport:
     n_attack: int
     n_benign: int
     roc_curve: list[ROCPoint] = field(default_factory=list)
-    # Comparison against the constant currently shipped in axor-core.
-    current_threshold: float = 0.8
+    # Comparison against the suspicion flag threshold sentinel currently ships
+    # (FLAG_THRESHOLD); the core detection_floor that pairs with it is 1 - this.
+    current_threshold: float = FLAG_THRESHOLD
     current_threshold_fpr: float = 0.0
     current_threshold_tpr: float = 0.0
 
@@ -92,13 +98,14 @@ def calibrate_threshold(
     scenarios: list["Scenario"],
     scores: dict[str, float],
     target_fpr: float = 0.02,
-    current_threshold: float = 0.8,
+    current_threshold: float = FLAG_THRESHOLD,
 ) -> CalibrationReport:
-    """Derive a reputation threshold meeting ``target_fpr`` from labeled scenarios.
+    """Derive a suspicion flag threshold meeting ``target_fpr`` from labeled scenarios.
 
-    scores maps scenario_id → reputation score in [0, 1]; missing → 0.0.
-    Picks the lowest threshold whose FPR ≤ target_fpr (maximising TPR), and
-    reports ROC/PR AUC plus how the currently-shipped constant performs.
+    scores maps scenario_id → suspicion score in [0, 1] (high = attack); missing → 0.0.
+    Picks the lowest threshold whose FPR ≤ target_fpr (maximising TPR), and reports
+    ROC/PR AUC plus how the currently-shipped flag threshold performs. The selected
+    suspicion threshold maps to a core ``detection_floor`` of ``1 - selected``.
     """
     labeled = [(scores.get(s.scenario_id, 0.0), s.label == "ATTACK") for s in scenarios]
     n_attack = sum(1 for _, atk in labeled if atk)

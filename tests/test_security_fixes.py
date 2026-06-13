@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -46,7 +47,24 @@ def _snapshot() -> ReputationSnapshot:
 def test_unsigned_snapshot_loads_without_key(tmp_path, monkeypatch):
     monkeypatch.delenv(SNAPSHOT_KEY_ENV, raising=False)
     atomic_swap(tmp_path, _snapshot())
-    loaded = load_snapshot(tmp_path)
+    # Loads (checksum-only) but warns loudly that it is unauthenticated (F7).
+    with pytest.warns(Warning, match="UNAUTHENTICATED"):
+        loaded = load_snapshot(tmp_path)
+    assert loaded is not None and loaded.resource_reputation["r1"] == 0.9
+
+
+def test_snapshot_with_unknown_field_still_loads(tmp_path, monkeypatch):
+    # Forward-compat: a snapshot written by a newer sentinel (extra top-level key)
+    # must load, not be rejected — integrity is over the reputation maps (F8).
+    monkeypatch.delenv(SNAPSHOT_KEY_ENV, raising=False)
+    snap = _snapshot()
+    atomic_swap(tmp_path, snap)
+    current = tmp_path / "snapshot_current"
+    data = json.loads(current.read_text())
+    data["future_field"] = {"unexpected": 123}
+    current.write_text(json.dumps(data))
+    with pytest.warns(Warning):  # unauthenticated warning
+        loaded = load_snapshot(tmp_path)
     assert loaded is not None and loaded.resource_reputation["r1"] == 0.9
 
 
@@ -71,7 +89,7 @@ def test_tampered_scores_rejected_when_key_set(tmp_path, monkeypatch):
     monkeypatch.delenv(SNAPSHOT_KEY_ENV, raising=False)
     forged = ReputationSnapshot(
         version=2, generated_at=0.0,
-        resource_reputation={"r1": 0.0},  # downgraded to evade Phase-1 deny
+        resource_reputation={"r1": 0.0},  # suspicion downgraded to dodge the floor
         container_reputation={},
     ).with_checksum()  # checksum recomputed by attacker, but no signature
     atomic_swap(tmp_path, forged)

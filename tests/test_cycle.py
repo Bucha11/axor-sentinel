@@ -26,14 +26,31 @@ from axor_sentinel.sentinel.events import AgentContainerBaseline
 
 # ── Mock Neo4j session ────────────────────────────────────────────────────────
 
+class _MockResult:
+    """Minimal stand-in for a neo4j Result: empty by default.
+
+    The cycle reads `.single()` off the hot-weight write and iterates the
+    score read-back; an empty result means no events and an empty snapshot, which
+    is exactly what these structure/logic tests want — score behaviour is asserted
+    against a live Neo4j in tests/test_neo4j_integration.py instead.
+    """
+
+    def single(self):
+        return None
+
+    def __iter__(self):
+        return iter(())
+
+
 class _MockNeo4j:
     """Records every query + params for assertion in tests."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
 
-    def run(self, query: str, **params) -> None:  # noqa: ANN001
+    def run(self, query: str, **params) -> _MockResult:  # noqa: ANN001
         self.calls.append((query, params))
+        return _MockResult()
 
     def was_called_with(self, fragment: str) -> bool:
         return any(fragment in q for q, _ in self.calls)
@@ -49,6 +66,7 @@ def _session(
     had_export: bool = False,
     had_failed: bool = False,
     taint_source: str = "mcp",
+    source_class: str = "",
 ) -> SessionSummary:
     accesses = [
         ResourceAccess(
@@ -69,6 +87,7 @@ def _session(
         had_escalation=False,
         accessed_resources=accesses,
         taint_source=taint_source,
+        source_class=source_class,
     )
 
 
@@ -85,44 +104,39 @@ def _cycle(tmp_path: Path, baselines: dict | None = None) -> tuple[SentinelCycle
 # ── End-to-end hot weight accumulation ───────────────────────────────────────
 
 class TestRunOnceHotWeights:
-    def test_tainted_session_increments_score(self, tmp_path: Path) -> None:
-        """run_once with a tainted session must produce a positive reputation score."""
-        cycle, _ = _cycle(tmp_path)
+    # NOTE: the actual scores now live in Neo4j and the snapshot is read back from
+    # it, so score-magnitude assertions (tainted → positive, higher signal → higher
+    # score, container aggregation, untainted → zero) run against a live Neo4j in
+    # tests/test_neo4j_integration.py::TestFullCycleSnapshot. These mock-level tests
+    # cover the call structure the cycle must always issue.
+
+    def test_tainted_session_issues_hot_weight_write(self, tmp_path: Path) -> None:
+        """A tainted access must drive a hot-weight write targeting that resource."""
+        cycle, neo4j = _cycle(tmp_path)
+        sess = _session("agent1", [("r1", "c1", 1.0, SignalType.READ)])
+        cycle.run_once([sess])
+
+        hot = [p for q, p in neo4j.calls if "had_taint" in q and "$raw_weight" in q]
+        assert any(p.get("resource_id") == "r1" for p in hot)
+
+    def test_untainted_session_issues_no_hot_weight_write(self, tmp_path: Path) -> None:
+        """Sessions without taint must not issue any hot-weight write."""
+        cycle, neo4j = _cycle(tmp_path)
+        sess = _session("agent1", [("r1", "c1", 1.0, SignalType.READ)], had_taint=False)
+        cycle.run_once([sess])
+
+        hot = [p for q, p in neo4j.calls if "had_taint" in q and "$raw_weight" in q]
+        assert hot == []
+
+    def test_snapshot_read_back_from_neo4j(self, tmp_path: Path) -> None:
+        """The snapshot resources come from the read-back query (empty under mock)."""
+        cycle, neo4j = _cycle(tmp_path)
         sess = _session("agent1", [("r1", "c1", 1.0, SignalType.READ)])
         snap = cycle.run_once([sess])
 
-        assert "r1" in snap.resource_reputation
-        assert snap.resource_reputation["r1"] > 0.0
-
-    def test_untainted_session_leaves_score_at_zero(self, tmp_path: Path) -> None:
-        """Sessions without taint must not affect resource scores."""
-        cycle, _ = _cycle(tmp_path)
-        sess = _session("agent1", [("r1", "c1", 1.0, SignalType.READ)], had_taint=False)
-        snap = cycle.run_once([sess])
-
-        assert snap.resource_reputation.get("r1", 0.0) == 0.0
-
-    def test_higher_signal_type_produces_higher_score(self, tmp_path: Path) -> None:
-        """READ_EXPORT_FAILED session → higher score than READ-only session."""
-        cycle_read, _ = _cycle(tmp_path / "read")
-        snap_read = cycle_read.run_once([
-            _session("a", [("r1", "c1", 1.0, SignalType.READ)])
-        ])
-
-        cycle_fail, _ = _cycle(tmp_path / "fail")
-        snap_fail = cycle_fail.run_once([
-            _session("a", [("r1", "c1", 1.0, SignalType.READ_EXPORT_FAILED)])
-        ])
-
-        assert snap_fail.resource_reputation["r1"] > snap_read.resource_reputation["r1"]
-
-    def test_container_scores_populated(self, tmp_path: Path) -> None:
-        """Container scores must be computed when container_members is provided."""
-        cycle, _ = _cycle(tmp_path)
-        sess = _session("a", [("r1", "c1", 1.0, SignalType.READ_SUMMARIZE)])
-        snap = cycle.run_once([sess], container_members={"c1": ["r1"]})
-
-        assert "c1" in snap.container_reputation
+        assert any("RETURN r.id AS id" in q for q, _ in neo4j.calls)
+        # Mock read-back yields no rows → snapshot reflects exactly that.
+        assert snap.resource_reputation == {}
 
     def test_snapshot_is_frozen(self, tmp_path: Path) -> None:
         """ReputationSnapshot must be immutable (frozen=True)."""
@@ -157,45 +171,8 @@ class TestFanoutWeightInSnapshot:
             last_updated=0.0,
         )
 
-    def test_fanout_boost_appears_in_snapshot(self, tmp_path: Path) -> None:
-        """
-        When a FanoutSignal fires, all touched resources must receive the extra
-        FANOUT_WEIGHT (0.5) accumulation on top of their hot weight.
-        The snapshot score must be higher than hot-weight-only.
-        """
-        agent = "fanout_agent"
-        baseline = self._make_baseline(agent)
-
-        # Cycle WITHOUT fanout baseline (no fanout trigger)
-        cycle_no_fanout, _ = _cycle(tmp_path / "no_fanout")
-        # Use only 1 container → z-score cannot exceed threshold
-        sess_no_fanout = _session(
-            agent,
-            [("r1", "c1", 1.0, SignalType.READ_SUMMARIZE)],
-            taint_source="src_a",
-        )
-        cycle_no_fanout.run_once([sess_no_fanout])
-
-        # Cycle WITH fanout baseline (many containers → high z-score)
-        cycle_fanout, neo4j_fanout = _cycle(tmp_path / "fanout", baselines={agent: baseline})
-        # 10 unique containers → z = (10 - 1.0) / 0.5 = 18 >> 2.5
-        resources = [
-            (f"r{i}", f"c{i}", 1.0, SignalType.READ_SUMMARIZE)
-            for i in range(10)
-        ]
-        sess_fanout = _session(agent, resources, taint_source="src_a")
-        snap_fanout = cycle_fanout.run_once([sess_fanout])
-
-        # The fanout-boosted snapshot must have strictly higher scores for r0
-        # r0 in no_fanout session was "r1" (we used r1 there); check r0 in fanout snap
-        fanout_score = snap_fanout.resource_reputation.get("r0", 0.0)
-
-        # With FANOUT_WEIGHT=0.5 the score for r0 must be higher than the
-        # READ_SUMMARIZE hot weight alone (0.6 * 1.0 = 0.6 headroom contribution)
-        # after fanout: accumulate(0.6, 0.5) = 0.6 + 0.5*(1-0.6) = 0.8
-        assert fanout_score > 0.6, (
-            f"Expected fanout-boosted score > 0.6, got {fanout_score}"
-        )
+    # The fanout score magnitude in the snapshot is asserted against a live Neo4j in
+    # tests/test_neo4j_integration.py::TestFullCycleSnapshot.test_fanout_boost_in_snapshot.
 
     def test_fanout_weight_written_to_neo4j(self, tmp_path: Path) -> None:
         """FANOUT_WEIGHT_QUERY must be sent to Neo4j when a fanout fires (invariant A-10)."""
@@ -362,3 +339,80 @@ class TestStatePersistence:
         cycle2 = SC(neo4j, tmp_path)   # no explicit baselines/signal_history
         assert cycle2._signal_history.get("r99") == ["mcp"]
         assert cycle2._current_version == 5
+
+
+class TestPoisoningMitigationKeying:
+    """F1: dampening/diversity key on the actor identity, not the attacker-controllable
+    taint_source label — rotating the label must not reset the mitigation."""
+
+    def test_rotating_taint_source_does_not_reset_dampening(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        # Same agent hits r1 twice, rotating the taint_source label each time.
+        cycle.run_once([_session("attacker", res, taint_source="web")])
+        cycle.run_once([_session("attacker", res, taint_source="mcp")])
+        # Keyed on the agent, the count accrued to ONE origin (dampening engages),
+        # not split across two source labels (which would keep dampening at 1.0).
+        assert cycle._prior_counts.get(("r1", "attacker")) == 2
+        assert ("r1", "web") not in cycle._prior_counts
+        assert ("r1", "mcp") not in cycle._prior_counts
+        assert cycle._signal_history["r1"] == ["attacker", "attacker"]
+
+    def test_distinct_agents_are_treated_as_distinct_origins(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        cycle.run_once([_session("agentA", res, taint_source="web")])
+        cycle.run_once([_session("agentB", res, taint_source="web")])
+        assert cycle._prior_counts.get(("r1", "agentA")) == 1
+        assert cycle._prior_counts.get(("r1", "agentB")) == 1
+
+    def test_authenticated_source_class_takes_precedence(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        # When core attests a source_class, it keys the mitigation (over agent_id).
+        cycle.run_once([_session("agentA", res, source_class="trusted-mcp")])
+        cycle.run_once([_session("agentB", res, source_class="trusted-mcp")])
+        assert cycle._prior_counts.get(("r1", "trusted-mcp")) == 2
+
+
+class TestCrashConsistencyAndLocking:
+    def test_state_persisted_before_snapshot_swap(self, tmp_path: Path, monkeypatch) -> None:
+        # If the swap crashes, state must already be persisted (version ahead of the
+        # snapshot) and no snapshot must have become visible — so the next run derives
+        # a fresh higher version rather than re-emitting this one with new content.
+        import axor_sentinel.sentinel.cycle as cyc
+
+        cycle, _ = _cycle(tmp_path)
+        sess = _session("agent1", [("r1", "c1", 1.0, SignalType.READ)])
+
+        def _boom(*a, **kw):
+            raise RuntimeError("swap crash")
+
+        monkeypatch.setattr(cyc, "atomic_swap", _boom)
+        with pytest.raises(RuntimeError, match="swap crash"):
+            cycle.run_once([sess])
+
+        # State was written (version 1) before the swap blew up.
+        _, _, _, ver = SentinelCycle.load_state(tmp_path / "sentinel_state.json")
+        assert ver == 1
+        # The snapshot never became visible.
+        assert not (tmp_path / "snapshot_current").exists()
+
+    def test_lock_held_during_cycle_and_released_after(self, tmp_path: Path, monkeypatch) -> None:
+        import axor_sentinel.sentinel.cycle as cyc
+
+        cycle, _ = _cycle(tmp_path)
+        seen = {}
+
+        real_swap = cyc.atomic_swap
+
+        def _checking_swap(*a, **kw):
+            seen["locked_during"] = cycle._lock.locked()
+            return real_swap(*a, **kw)
+
+        monkeypatch.setattr(cyc, "atomic_swap", _checking_swap)
+        cycle.run_once([])
+
+        assert seen["locked_during"] is True          # held across the cycle body
+        assert cycle._lock.acquire(blocking=False)     # released afterwards
+        cycle._lock.release()

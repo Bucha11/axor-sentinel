@@ -22,14 +22,22 @@ SET r.last_decay_at = timestamp()
 # Apply graded hot weights after a tainted session.
 # effective_weight = raw_weight * canonical_confidence (A-8 base; diversity/dampening pre-computed).
 # last_signal_at updated; last_decay_at NOT updated (invariant A-3).
+#
+# Matched on the SPECIFIC resource id (not just signal_type): a session can access
+# several resources sharing one signal_type, and the cycle calls this once per
+# access — without the id filter every call would re-apply to all of them, which is
+# now a live double-count since the snapshot reads these scores back. Returns the
+# resource's score before/after so the cycle can record faithful evidence without
+# re-deriving it in Python (the source-of-truth is Neo4j).
 HOT_WEIGHT_QUERY = """
 MATCH (s:Session {had_taint: true, session_id: $session_id})
-MATCH (s)-[a:ACCESSED {signal_type: $signal_type}]->(r:Resource)
-WITH r, $raw_weight * r.canonical_confidence AS eff_weight
-SET r.suspicion_score = min(1.0,
-    r.suspicion_score + eff_weight * (1.0 - r.suspicion_score))
+MATCH (s)-[a:ACCESSED {signal_type: $signal_type}]->(r:Resource {id: $resource_id})
+WITH r, r.suspicion_score AS score_before, $raw_weight * r.canonical_confidence AS eff_weight
+WITH r, score_before, score_before + eff_weight * (1.0 - score_before) AS new_score
+SET r.suspicion_score = CASE WHEN new_score > 1.0 THEN 1.0 ELSE new_score END
 SET r.flagged = (r.suspicion_score >= $flag_threshold)
 SET r.last_signal_at = timestamp()
+RETURN score_before AS score_before, r.suspicion_score AS score_after
 """
 
 # Apply caution to adjacent resources not directly accessed in the session.
@@ -47,8 +55,9 @@ WITH neighbor, tf,
      neighbor.canonical_confidence AS conf
 WITH neighbor,
      caution_weight * conf AS eff_weight
-SET neighbor.suspicion_score = min(1.0,
-    neighbor.suspicion_score + eff_weight * (1.0 - neighbor.suspicion_score))
+WITH neighbor,
+     neighbor.suspicion_score + eff_weight * (1.0 - neighbor.suspicion_score) AS new_score
+SET neighbor.suspicion_score = CASE WHEN new_score > 1.0 THEN 1.0 ELSE new_score END
 SET neighbor.flagged = (neighbor.suspicion_score >= $flag_threshold)
 SET neighbor.last_signal_at = timestamp()
 """
@@ -59,9 +68,20 @@ SET neighbor.last_signal_at = timestamp()
 FANOUT_WEIGHT_QUERY = """
 UNWIND $resource_ids AS rid
 MATCH (r:Resource {id: rid})
-SET r.suspicion_score = min(1.0, r.suspicion_score + $fanout_weight * (1.0 - r.suspicion_score))
+WITH r, r.suspicion_score + $fanout_weight * (1.0 - r.suspicion_score) AS new_score
+SET r.suspicion_score = CASE WHEN new_score > 1.0 THEN 1.0 ELSE new_score END
 SET r.flagged = (r.suspicion_score >= $flag_threshold)
 SET r.last_signal_at = timestamp()
+"""
+
+# Read every resource's current suspicion_score back from the graph.  Neo4j is the
+# source of truth for the snapshot: after decay + hot + fanout + caution have run,
+# the cycle reads scores from HERE rather than re-accumulating in Python.  Resources
+# at score 0 carry no reputation, so they are excluded to keep the snapshot lean.
+RESOURCE_SCORES_QUERY = """
+MATCH (r:Resource)
+WHERE r.suspicion_score > 0
+RETURN r.id AS id, r.suspicion_score AS score
 """
 
 # Slow-and-low detection: agent with a tainted session followed by an export session,
@@ -103,9 +123,10 @@ def apply_hot_weight(
     signal_type: str,
     raw_weight: float,
     flag_threshold: float,
-) -> None:
+    resource_id: str,
+) -> tuple[float, float] | None:
     """
-    Apply graded hot weight to resources accessed in a tainted session.
+    Apply graded hot weight to ONE resource accessed in a tainted session.
 
     Args:
         session:        neo4j.Session
@@ -113,14 +134,32 @@ def apply_hot_weight(
         signal_type:    SignalType value string
         raw_weight:     pre-computed raw weight (before canonical_confidence scaling)
         flag_threshold: threshold for flagged=True
+        resource_id:    the specific resource the signal applies to
+
+    Returns:
+        ``(score_before, score_after)`` for the resource, or ``None`` if the
+        session/edge/resource did not match (e.g. untainted session).
     """
-    session.run(
+    rec = session.run(
         HOT_WEIGHT_QUERY,
         session_id=session_id,
         signal_type=signal_type,
         raw_weight=raw_weight,
         flag_threshold=flag_threshold,
-    )
+        resource_id=resource_id,
+    ).single()
+    if rec is None:
+        return None
+    return rec["score_before"], rec["score_after"]
+
+
+def read_resource_scores(session: Any) -> dict[str, float]:
+    """
+    Read every resource's current suspicion_score from Neo4j (the snapshot source
+    of truth). Returns ``{resource_id: score}`` for all resources with score > 0.
+    """
+    result = session.run(RESOURCE_SCORES_QUERY)
+    return {rec["id"]: rec["score"] for rec in result}
 
 
 def apply_caution_adjacent(

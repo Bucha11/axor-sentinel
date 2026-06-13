@@ -35,6 +35,7 @@ class _FakeRecord:
     taint_sources: tuple[str, ...] = ()
     event_kinds: tuple[str, ...] = ()
     tool_invocations: tuple[_FakeInvocation, ...] = field(default_factory=tuple)
+    source_class: str = ""
 
 
 def _run(coro):
@@ -42,6 +43,14 @@ def _run(coro):
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────────
+
+def test_fake_record_satisfies_the_structural_contract():
+    # The fake must conform to the sentinel-defined CoreSessionRecord Protocol —
+    # otherwise these tests would pass against a shape the sink can't really consume.
+    from axor_sentinel.integration.core_sink import CoreSessionRecord, ToolInvocationRecord
+    assert isinstance(_FakeRecord(), CoreSessionRecord)
+    assert isinstance(_FakeInvocation(tool="x", args={}), ToolInvocationRecord)
+
 
 def test_read_only_session_maps_to_read_grade():
     sink = CoreSessionSink()

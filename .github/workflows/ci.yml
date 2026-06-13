@@ -17,6 +17,27 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
 
+    services:
+      neo4j:
+        image: neo4j:5
+        env:
+          # Disable auth so the integration tests can connect without credentials.
+          NEO4J_AUTH: none
+        ports:
+          - 7687:7687   # Bolt
+          - 7474:7474   # HTTP (used by the health check)
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://localhost:7474 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+
+    env:
+      # Presence of this var un-skips tests/test_neo4j_integration.py, which run the
+      # real Cypher + full cycle against the neo4j service above. Unset locally → skipped.
+      AXOR_TEST_NEO4J_BOLT: bolt://localhost:7687
+
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +69,7 @@ jobs:
 
       - name: Install
         run: |
-          pip install -e ".[dev]"
+          pip install -e ".[dev,neo4j]"
 
       - name: Static analysis — no axor-sentinel imports in axor-core
         run: |
