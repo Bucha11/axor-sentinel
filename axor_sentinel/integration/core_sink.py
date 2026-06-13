@@ -9,12 +9,13 @@ from axor_sentinel.graph.normalizer import normalize_resource_id
 from axor_sentinel.sentinel.cycle import ResourceAccess, SessionSummary
 
 
-# Structural contract for a closed-session record from core. axor-core does NOT yet
-# emit such a record (there is no SessionSink / SessionAuditRecord in core today),
-# so this is a FORWARD integration: sentinel defines the shape it consumes here,
-# and a host adapter (or a future core observation contract) can satisfy it by
-# duck typing. Defining it sentinel-side keeps the attachment structural (invariant
-# P-34) and self-contained — no import edge into a core module that may not exist.
+# Structural contract for a closed-session record from core. The matching record now
+# exists core-side as ``axor_core.contracts.session.SessionAuditRecord`` (emitted from
+# ``GovernedSession.aclose()`` via its ``session_sink`` hook). We re-declare the shape
+# here rather than import it: sentinel attaches STRUCTURALLY (invariant P-34) so there
+# is no import edge into core, and either a core ``SessionAuditRecord`` or any host
+# adapter that duck-types these fields satisfies it. Keep the field names/types in
+# lockstep with core's contract — they are matched by name at runtime, not by import.
 @runtime_checkable
 class ToolInvocationRecord(Protocol):
     tool: str
@@ -58,11 +59,13 @@ class CoreSessionSink:
     """
     Buckets a closed core session (``CoreSessionRecord``) into a ``SessionSummary``.
 
-    FORWARD INTEGRATION: axor-core does not yet emit a per-session record or call an
-    ``on_session_closed`` sink — there is no such contract in core today. This sink
-    is ready for when a host adapter (or a future core observation contract) hands
-    over closed sessions shaped like ``CoreSessionRecord`` (defined above,
-    sentinel-side). Until then it has no producer and is exercised only by tests.
+    CROSS-REPO SEAM: core emits a closed-session record on ``GovernedSession.aclose()``
+    when constructed with ``session_sink=<this sink>`` — its
+    ``axor_core.contracts.session.SessionSink`` Protocol declares the same
+    ``on_session_closed(record)`` method this class implements, so an instance
+    satisfies it structurally (no import edge either way, P-34). A host adapter still
+    wires the two together (passing a ``CoreSessionSink`` as core's ``session_sink``);
+    core never imports sentinel, sentinel never imports core.
 
     The counterpart to ``ProbeTaintBridge``, but for *full* core sessions rather
     than just probe-flagged ones. Given a record's raw facts (``taint_active`` /
