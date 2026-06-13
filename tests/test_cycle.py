@@ -362,3 +362,46 @@ class TestStatePersistence:
         cycle2 = SC(neo4j, tmp_path)   # no explicit baselines/signal_history
         assert cycle2._signal_history.get("r99") == ["mcp"]
         assert cycle2._current_version == 5
+
+
+class TestCrashConsistencyAndLocking:
+    def test_state_persisted_before_snapshot_swap(self, tmp_path: Path, monkeypatch) -> None:
+        # If the swap crashes, state must already be persisted (version ahead of the
+        # snapshot) and no snapshot must have become visible — so the next run derives
+        # a fresh higher version rather than re-emitting this one with new content.
+        import axor_sentinel.sentinel.cycle as cyc
+
+        cycle, _ = _cycle(tmp_path)
+        sess = _session("agent1", [("r1", "c1", 1.0, SignalType.READ)])
+
+        def _boom(*a, **kw):
+            raise RuntimeError("swap crash")
+
+        monkeypatch.setattr(cyc, "atomic_swap", _boom)
+        with pytest.raises(RuntimeError, match="swap crash"):
+            cycle.run_once([sess])
+
+        # State was written (version 1) before the swap blew up.
+        _, _, _, ver = SentinelCycle.load_state(tmp_path / "sentinel_state.json")
+        assert ver == 1
+        # The snapshot never became visible.
+        assert not (tmp_path / "snapshot_current").exists()
+
+    def test_lock_held_during_cycle_and_released_after(self, tmp_path: Path, monkeypatch) -> None:
+        import axor_sentinel.sentinel.cycle as cyc
+
+        cycle, _ = _cycle(tmp_path)
+        seen = {}
+
+        real_swap = cyc.atomic_swap
+
+        def _checking_swap(*a, **kw):
+            seen["locked_during"] = cycle._lock.locked()
+            return real_swap(*a, **kw)
+
+        monkeypatch.setattr(cyc, "atomic_swap", _checking_swap)
+        cycle.run_once([])
+
+        assert seen["locked_during"] is True          # held across the cycle body
+        assert cycle._lock.acquire(blocking=False)     # released afterwards
+        cycle._lock.release()

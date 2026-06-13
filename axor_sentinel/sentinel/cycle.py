@@ -4,6 +4,7 @@ import dataclasses
 import json
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -115,6 +116,9 @@ class SentinelCycle:
         self._snapshot_dir = Path(snapshot_dir)
         self._reputation_events: list[ReputationEvent] = []
         self._fanout_signals: list[FanoutSignal] = []
+        # Serialise cycles: run_once mutates _signal_history / _prior_counts /
+        # _baselines / _current_version, none of which is safe under overlap.
+        self._lock = threading.Lock()
 
         # In-memory resource scores (updated during a cycle, then snapshot-written)
         self._resource_scores: dict[str, float] = {}
@@ -160,7 +164,19 @@ class SentinelCycle:
 
         Returns:
             The newly written ReputationSnapshot.
+
+        Serialised by an instance lock — overlapping cycles would corrupt the
+        in-memory counters and the version sequence.
         """
+        with self._lock:
+            return self._run_once_locked(sessions, resource_scores, container_members)
+
+    def _run_once_locked(
+        self,
+        sessions: list[SessionSummary],
+        resource_scores: dict[str, float] | None,
+        container_members: dict[str, list[str]] | None,
+    ) -> ReputationSnapshot:
         now = time.time()
         scores = dict(resource_scores) if resource_scores else {}
         cmembers = dict(container_members) if container_members else {}
@@ -270,7 +286,7 @@ class SentinelCycle:
             member_scores = [scores.get(rid, 0.0) for rid in member_ids]
             container_scores[cid] = compute_container_score(member_scores)
 
-        # Step 3 — atomically write new snapshot (invariant A-5)
+        # Step 3 — write the new snapshot (invariant A-5).
         self._current_version += 1
         snapshot = ReputationSnapshot(
             version=self._current_version,
@@ -278,6 +294,13 @@ class SentinelCycle:
             resource_reputation=scores,
             container_reputation=container_scores,
         ).with_checksum()
+
+        # Crash-consistency: persist state (which records _current_version) BEFORE
+        # making the snapshot visible. If we crash in between, state is AHEAD of the
+        # snapshot — the next run derives a fresh higher version — rather than behind
+        # it, which would re-emit THIS version with different content (a consumer
+        # would see two distinct snapshots at the same version).
+        self.save_state()
         atomic_swap(self._snapshot_dir, snapshot)
 
         log.info(
@@ -287,9 +310,6 @@ class SentinelCycle:
             len(container_scores),
             len(self._reputation_events),
         )
-
-        # Persist state so poisoning-mitigation counters and baselines survive restarts.
-        self.save_state()
 
         return snapshot
 
