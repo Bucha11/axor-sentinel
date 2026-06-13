@@ -37,16 +37,29 @@ twice — once in Python (`weight.accumulate`) and once in Cypher (`HOT_WEIGHT_Q
 are applied only in Neo4j**, never to the in-memory `scores`, so the snapshot written
 *this* cycle omits caution/decay until the *next* cycle reads Neo4j back.
 
-**Why deferred:** this is the riskiest part of the system to change; the eventual-
-consistency (caution/decay appear next cycle) is a real latency property, not a
-crash. A correct fix is a single-source-of-truth refactor: make Neo4j authoritative
-and build the snapshot by reading scores *back* from Neo4j after all writes (decay,
-hot, caution, fanout), removing the Python re-accumulation entirely. That deletes the
-dual-write and the pre-scaling trick. Guard with the full suite; verify snapshot
-values match a Neo4j read-back on a fixture graph.
+**Discovered when a live Neo4j was finally run against the queries (5.26):** the
+Neo4j write path was not merely lagging — it was **non-functional**:
+1. Three of the five write queries (`HOT_WEIGHT`, `CAUTION_ADJACENT`,
+   `FANOUT_WEIGHT`) used `min(1.0, …)` — an *aggregating* function — in a `SET`,
+   which is a **syntax error on Neo4j 5.x**; they would crash on any real server.
+   (Now fixed: scalar `CASE WHEN new > 1.0 THEN 1.0 ELSE new END`, validated end-to-
+   end against Neo4j 5.26 — see `tests/test_neo4j_integration.py`.)
+2. Sentinel **never creates any graph nodes/edges** (no `MERGE`/`CREATE` anywhere),
+   so even the parseable queries match nothing on the graph nobody populates. The
+   in-memory Python path is the only working, tested scorer; the Cypher writes have
+   never run against a real graph.
 
-**Interim:** the eventual-consistency property is now documented; do not rely on a
-single cycle reflecting caution/decay.
+**So full "Neo4j-authoritative read-back" is a FEATURE, not a refactor.** It needs:
+(a) a graph-construction layer — upsert `Session`/`Resource`/`Agent` nodes +
+`ACCESSED`/`IN_SESSION` edges per cycle (none of this exists); (b) a source for the
+`ADJACENT_TO` topology the caution query walks (no producer in sentinel, so caution
+is inert regardless); (c) then build the snapshot by reading scores back from Neo4j
+after all writes, deleting the Python re-accumulation. Validate with the live-Neo4j
+test harness (`AXOR_TEST_NEO4J_BOLT`).
+
+**Done in this pass:** the hand-tuned pre-scale drift is gone (`compute_weight_factors`),
+and the broken Cypher is fixed + validated against a real server. The snapshot/Neo4j
+eventual-consistency for caution/decay remains (Python is authoritative).
 
 ## 2. Cycle concurrency & crash-consistency — DONE (see Status)
 
