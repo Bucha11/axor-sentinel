@@ -8,7 +8,26 @@ code, doc drift, and snapshot hardening (F7/F8) were already fixed.
 
 ---
 
-## 1. Dual-write scoring (in-memory dict ↔ Neo4j) — MAJOR (engineering risk)
+## Status (this pass)
+
+- **#2 concurrency/crash-consistency — DONE.** `run_once` is serialised by an
+  instance lock; `save_state` now runs before `atomic_swap` (state ahead of snapshot
+  on crash); version is in the signed state blob.
+- **#1 dual-write — PARTIALLY DONE.** The hand-tuned pre-scale drift is gone:
+  `compute_weight_factors` is the single source for both the in-memory `effective`
+  weight and the Cypher `without_confidence`. The full Neo4j-authoritative read-back
+  (which would also fold caution/decay into the same-cycle snapshot) is **not** done —
+  it needs a real Neo4j to validate and the env has none (the test mock does not
+  execute Cypher). Item 1 below is rescoped to that remaining read-back work.
+- **#3 F1 anti-poisoning keying — DONE.** Dampening/diversity now key on
+  `mitigation_origin` (authenticated `source_class` if attested, else `agent_id`),
+  not the attacker-controllable `taint_source`. Item 3 below records the residual.
+
+---
+
+## 1. Dual-write scoring (in-memory dict ↔ Neo4j) — MAJOR (engineering risk) — REMAINING: read-back
+
+The pre-scale drift is fixed (see Status). What remains needs a live Neo4j:
 
 **Where:** `axor_sentinel/sentinel/cycle.py` `run_once`. Scores are maintained in two
 stores reconciled by convention: an in-memory `scores` dict (the snapshot source of
@@ -29,7 +48,7 @@ values match a Neo4j read-back on a fixture graph.
 **Interim:** the eventual-consistency property is now documented; do not rely on a
 single cycle reflecting caution/decay.
 
-## 2. Cycle concurrency & crash-consistency — MAJOR
+## 2. Cycle concurrency & crash-consistency — DONE (see Status)
 
 **Where:** `cycle.py` `run_once` mutates `_signal_history` / `_prior_counts` /
 `_baselines` / `_current_version` with no lock, and there is no guard that version
@@ -44,19 +63,20 @@ the snapshot swap so a crash leaves state ahead of the snapshot (next run re-der
 fresh snapshot) rather than behind; (c) include the snapshot version in the signed
 state so a mismatch is detectable on load. Add a crash-ordering test.
 
-## 3. Anti-poisoning keyed on attacker-controlled `taint_source` (F1) — MAJOR (graph integrity)
+## 3. Anti-poisoning keyed on attacker-controlled `taint_source` (F1) — DONE, with a residual
 
-**Where:** `weight.source_diversity_factor` / `weight.origin_dampening`, keyed on
-`(resource_id, taint_source)` in `cycle.py`. `taint_source` comes from the session
-record and is attacker-influenceable, so rotating the label resets both factors.
+**Fixed:** dampening/diversity now key on `SessionSummary.mitigation_origin` —
+the authenticated `source_class` (forward contract, threaded through `CoreSessionRecord`)
+when core attests one, else `agent_id` — never the rotatable `taint_source` label.
+Rotating the label no longer resets the mitigation (regression-tested in
+`test_cycle.py::TestPoisoningMitigationKeying`).
 
-**Why deferred:** there is no truly authenticated identity in sentinel's inputs, so
-this is partly inherent. Keying on fewer dimensions (per-resource, source-agnostic)
-makes dampening rotation-proof but penalizes legitimately multi-source access; keying
-on more dimensions is easier to evade. A real fix needs core to hand sentinel an
-*authenticated* source class (a trusted label assigned kernel-side), which is a
-cross-repo contract change. Documented as a known limitation
-(`docs/architecture.md` §10a) until then.
+**Residual (needs core):** when no `source_class` is attested, the fallback `agent_id`
+is only as trustworthy as the upstream agent-identity authentication. An attacker who
+can mint distinct agent identities can still spread the count across them. Fully
+closing this needs core to attest `source_class` on the (forward) session record —
+the `CoreSessionRecord.source_class` field is already in place to receive it. Bounded
+meanwhile by observe-only core.
 
 ## 4. `update_resource_score` vs. inline cycle accumulation — MINOR (duplication)
 

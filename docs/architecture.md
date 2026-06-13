@@ -449,12 +449,15 @@ limitations below — a poisoned score cannot cause a wrong deny.
   score. Accumulation is bounded to `[0, 1]` and dampened, but the score is evidence
   of *access concentration*, not attacker-proof intent. Do not treat a high score as
   unforgeable.
-- **Anti-poisoning factors key on the claimed `taint_source`.** `origin_dampening`
-  and `source_diversity_factor` are keyed on `(resource_id, taint_source)`, and
-  `taint_source` is an attacker-influenceable origin label, not an authenticated
-  class. An attacker who rotates the source label resets the dampening — so the
-  factors raise the *cost* of single-origin hammering but do not stop a label-rotating
-  attacker. (Tracked as a follow-up — see `docs/deferred-followups.md`.)
+- **Anti-poisoning factors key on the actor identity, not the claimed source label.**
+  `origin_dampening` and `source_diversity_factor` key on `SessionSummary.mitigation_origin`
+  — the authenticated `source_class` core attests when available, else the `agent_id`
+  — never the attacker-controllable `taint_source` label. So rotating the source label
+  no longer resets dampening (the F1 fix); an attacker would have to rotate the actor
+  identity, which requires distinct authenticated principals. Residual: if `agent_id`
+  itself is not authenticated upstream (no `source_class` attested), an attacker who
+  can spin up distinct agent identities can still spread the count — bounded by
+  observe-only core, and fully closed once core attests `source_class`.
 - **Time-decay wait-out.** Scores halve every 30 days with no floor for once-flagged
   resources, so a slow-and-low attacker pacing staging beyond a decay half-life keeps
   any single resource under threshold. The bench only exercises 7-day gaps.

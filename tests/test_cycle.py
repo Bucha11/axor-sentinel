@@ -49,6 +49,7 @@ def _session(
     had_export: bool = False,
     had_failed: bool = False,
     taint_source: str = "mcp",
+    source_class: str = "",
 ) -> SessionSummary:
     accesses = [
         ResourceAccess(
@@ -69,6 +70,7 @@ def _session(
         had_escalation=False,
         accessed_resources=accesses,
         taint_source=taint_source,
+        source_class=source_class,
     )
 
 
@@ -362,6 +364,40 @@ class TestStatePersistence:
         cycle2 = SC(neo4j, tmp_path)   # no explicit baselines/signal_history
         assert cycle2._signal_history.get("r99") == ["mcp"]
         assert cycle2._current_version == 5
+
+
+class TestPoisoningMitigationKeying:
+    """F1: dampening/diversity key on the actor identity, not the attacker-controllable
+    taint_source label — rotating the label must not reset the mitigation."""
+
+    def test_rotating_taint_source_does_not_reset_dampening(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        # Same agent hits r1 twice, rotating the taint_source label each time.
+        cycle.run_once([_session("attacker", res, taint_source="web")])
+        cycle.run_once([_session("attacker", res, taint_source="mcp")])
+        # Keyed on the agent, the count accrued to ONE origin (dampening engages),
+        # not split across two source labels (which would keep dampening at 1.0).
+        assert cycle._prior_counts.get(("r1", "attacker")) == 2
+        assert ("r1", "web") not in cycle._prior_counts
+        assert ("r1", "mcp") not in cycle._prior_counts
+        assert cycle._signal_history["r1"] == ["attacker", "attacker"]
+
+    def test_distinct_agents_are_treated_as_distinct_origins(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        cycle.run_once([_session("agentA", res, taint_source="web")])
+        cycle.run_once([_session("agentB", res, taint_source="web")])
+        assert cycle._prior_counts.get(("r1", "agentA")) == 1
+        assert cycle._prior_counts.get(("r1", "agentB")) == 1
+
+    def test_authenticated_source_class_takes_precedence(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        # When core attests a source_class, it keys the mitigation (over agent_id).
+        cycle.run_once([_session("agentA", res, source_class="trusted-mcp")])
+        cycle.run_once([_session("agentB", res, source_class="trusted-mcp")])
+        assert cycle._prior_counts.get(("r1", "trusted-mcp")) == 2
 
 
 class TestCrashConsistencyAndLocking:

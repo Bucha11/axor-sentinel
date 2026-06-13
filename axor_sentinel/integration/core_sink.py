@@ -31,6 +31,10 @@ class CoreSessionRecord(Protocol):
     taint_sources: Sequence[str]
     event_kinds: Sequence[str]
     tool_invocations: Sequence[ToolInvocationRecord]
+    # Authenticated source class core attests for poisoning-mitigation keying. Empty
+    # when core cannot attest one; sentinel then falls back to the agent_id (never to
+    # the attacker-controllable taint_source label). See F1 in architecture.md §10a.
+    source_class: str
 
 
 log = logging.getLogger("axor.sentinel.core_sink")
@@ -143,6 +147,7 @@ class CoreSessionSink:
             had_escalation=had_escalation,
             accessed_resources=accessed_resources,
             taint_source=taint_source,
+            source_class=getattr(record, "source_class", "") or "",
         )
 
     def _map_access(self, inv, event_kinds: tuple[str, ...]) -> ResourceAccess:

@@ -35,6 +35,7 @@ class _FakeRecord:
     taint_sources: tuple[str, ...] = ()
     event_kinds: tuple[str, ...] = ()
     tool_invocations: tuple[_FakeInvocation, ...] = field(default_factory=tuple)
+    source_class: str = ""
 
 
 def _run(coro):

@@ -72,7 +72,19 @@ class SessionSummary:
     had_failed_export: bool
     had_escalation: bool
     accessed_resources: list[ResourceAccess] = field(default_factory=list)
-    taint_source: str = "unknown_external"   # TaintSource.value
+    taint_source: str = "unknown_external"   # TaintSource.value — descriptive evidence
+    # Authenticated source class, when core can attest one (forward contract). Empty
+    # = not attested. NEVER set from the attacker-influenceable taint_source label.
+    source_class: str = ""
+
+    @property
+    def mitigation_origin(self) -> str:
+        """The origin key the poisoning-mitigation factors (dampening / diversity)
+        key on. Uses the authenticated source_class when present, else the agent_id —
+        both are the *actor* identity, far harder to rotate than the taint_source
+        label (which an attacker controls and could rotate to reset dampening). See
+        the F1 limitation in docs/architecture.md §10a."""
+        return self.source_class or self.agent_id or self.taint_source
 
 
 class SentinelCycle:
@@ -198,12 +210,17 @@ class SentinelCycle:
             if fanout is not None:
                 self._fanout_signals.append(fanout)
 
+            # Poisoning-mitigation factors key on the actor identity (source_class or
+            # agent_id), NOT the attacker-controllable taint_source label — rotating
+            # that label must not reset dampening/diversity (F1).
+            origin = session.mitigation_origin
+
             # 2c — apply hot weights per accessed resource
             for access in session.accessed_resources:
                 rid = access.resource_id
                 raw_weight = compute_hot_weight(access.signal_type)
                 history = self._signal_history.get(rid, [])
-                prior = self._prior_counts.get((rid, session.taint_source), 0)
+                prior = self._prior_counts.get((rid, origin), 0)
                 # Single source for both weight views — the in-memory `effective`
                 # (fed to accumulate) and the Cypher `without_confidence` (the query
                 # multiplies by r.canonical_confidence) can no longer drift.
@@ -211,7 +228,7 @@ class SentinelCycle:
                     raw_weight=raw_weight,
                     canonical_confidence=access.canonical_confidence,
                     signal_history=history,
-                    current_source=session.taint_source,
+                    current_source=origin,
                     prior_count_from_source=prior,
                 )
                 eff_weight = wf.effective
@@ -254,9 +271,10 @@ class SentinelCycle:
                 )
                 self._reputation_events.append(event)
 
-                # Update signal history and prior counts
-                self._signal_history.setdefault(rid, []).append(session.taint_source)
-                key = (rid, session.taint_source)
+                # Update signal history and prior counts — keyed on the actor origin
+                # (see `origin` above), so source-label rotation cannot reset them.
+                self._signal_history.setdefault(rid, []).append(origin)
+                key = (rid, origin)
                 self._prior_counts[key] = self._prior_counts.get(key, 0) + 1
 
             # 2d(fanout) — write fanout flat weight to Neo4j (invariant A-10).
