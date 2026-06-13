@@ -9,3 +9,6 @@ dist/
 build/
 .venv/
 venv/
+.coverage
+htmlcov/
+.coverage.*
