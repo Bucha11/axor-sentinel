@@ -4,6 +4,7 @@ import dataclasses
 import json
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,11 +27,9 @@ from axor_sentinel.sentinel.snapshot import (
 from axor_sentinel.sentinel.weight import (
     FLAG_THRESHOLD,
     accumulate,
-    compute_effective_weight,
+    compute_weight_factors,
     compute_hot_weight,
     compute_container_score,
-    origin_dampening,
-    source_diversity_factor,
 )
 
 log = logging.getLogger("axor.sentinel.cycle")
@@ -73,7 +72,19 @@ class SessionSummary:
     had_failed_export: bool
     had_escalation: bool
     accessed_resources: list[ResourceAccess] = field(default_factory=list)
-    taint_source: str = "unknown_external"   # TaintSource.value
+    taint_source: str = "unknown_external"   # TaintSource.value — descriptive evidence
+    # Authenticated source class, when core can attest one (forward contract). Empty
+    # = not attested. NEVER set from the attacker-influenceable taint_source label.
+    source_class: str = ""
+
+    @property
+    def mitigation_origin(self) -> str:
+        """The origin key the poisoning-mitigation factors (dampening / diversity)
+        key on. Uses the authenticated source_class when present, else the agent_id —
+        both are the *actor* identity, far harder to rotate than the taint_source
+        label (which an attacker controls and could rotate to reset dampening). See
+        the F1 limitation in docs/architecture.md §10a."""
+        return self.source_class or self.agent_id or self.taint_source
 
 
 class SentinelCycle:
@@ -115,6 +126,9 @@ class SentinelCycle:
         self._snapshot_dir = Path(snapshot_dir)
         self._reputation_events: list[ReputationEvent] = []
         self._fanout_signals: list[FanoutSignal] = []
+        # Serialise cycles: run_once mutates _signal_history / _prior_counts /
+        # _baselines / _current_version, none of which is safe under overlap.
+        self._lock = threading.Lock()
 
         # In-memory resource scores (updated during a cycle, then snapshot-written)
         self._resource_scores: dict[str, float] = {}
@@ -160,7 +174,19 @@ class SentinelCycle:
 
         Returns:
             The newly written ReputationSnapshot.
+
+        Serialised by an instance lock — overlapping cycles would corrupt the
+        in-memory counters and the version sequence.
         """
+        with self._lock:
+            return self._run_once_locked(sessions, resource_scores, container_members)
+
+    def _run_once_locked(
+        self,
+        sessions: list[SessionSummary],
+        resource_scores: dict[str, float] | None,
+        container_members: dict[str, list[str]] | None,
+    ) -> ReputationSnapshot:
         now = time.time()
         scores = dict(resource_scores) if resource_scores else {}
         cmembers = dict(container_members) if container_members else {}
@@ -184,19 +210,28 @@ class SentinelCycle:
             if fanout is not None:
                 self._fanout_signals.append(fanout)
 
+            # Poisoning-mitigation factors key on the actor identity (source_class or
+            # agent_id), NOT the attacker-controllable taint_source label — rotating
+            # that label must not reset dampening/diversity (F1).
+            origin = session.mitigation_origin
+
             # 2c — apply hot weights per accessed resource
             for access in session.accessed_resources:
                 rid = access.resource_id
                 raw_weight = compute_hot_weight(access.signal_type)
                 history = self._signal_history.get(rid, [])
-                prior = self._prior_counts.get((rid, session.taint_source), 0)
-                eff_weight = compute_effective_weight(
+                prior = self._prior_counts.get((rid, origin), 0)
+                # Single source for both weight views — the in-memory `effective`
+                # (fed to accumulate) and the Cypher `without_confidence` (the query
+                # multiplies by r.canonical_confidence) can no longer drift.
+                wf = compute_weight_factors(
                     raw_weight=raw_weight,
                     canonical_confidence=access.canonical_confidence,
                     signal_history=history,
-                    current_source=session.taint_source,
+                    current_source=origin,
                     prior_count_from_source=prior,
                 )
+                eff_weight = wf.effective
 
                 score_before = scores.get(rid, 0.0)
                 score_after = accumulate(score_before, eff_weight)
@@ -207,19 +242,14 @@ class SentinelCycle:
 
                 scores[rid] = score_after
 
-                # Apply to Neo4j.
-                # The Cypher query multiplies $raw_weight by r.canonical_confidence,
-                # so we pass a pre-scaled weight = raw_weight * diversity * dampening
-                # (everything except canonical_confidence) so the query result matches
-                # the in-memory effective_weight (invariant A-8).
-                div_f = source_diversity_factor(history, session.taint_source)
-                damp_f = origin_dampening(prior)
-                neo4j_raw = raw_weight * div_f * damp_f  # Cypher will multiply by canonical_confidence
+                # Mirror to Neo4j (next-cycle authoritative store). The hot-weight
+                # Cypher multiplies $raw_weight by r.canonical_confidence, so we hand
+                # it wf.without_confidence (raw * diversity * dampening).
                 q.apply_hot_weight(
                     self._neo4j,
                     session_id=session.session_id,
                     signal_type=access.signal_type.value,
-                    raw_weight=neo4j_raw,
+                    raw_weight=wf.without_confidence,
                     flag_threshold=FLAG_THRESHOLD,
                 )
 
@@ -241,9 +271,10 @@ class SentinelCycle:
                 )
                 self._reputation_events.append(event)
 
-                # Update signal history and prior counts
-                self._signal_history.setdefault(rid, []).append(session.taint_source)
-                key = (rid, session.taint_source)
+                # Update signal history and prior counts — keyed on the actor origin
+                # (see `origin` above), so source-label rotation cannot reset them.
+                self._signal_history.setdefault(rid, []).append(origin)
+                key = (rid, origin)
                 self._prior_counts[key] = self._prior_counts.get(key, 0) + 1
 
             # 2d(fanout) — write fanout flat weight to Neo4j (invariant A-10).
@@ -270,7 +301,7 @@ class SentinelCycle:
             member_scores = [scores.get(rid, 0.0) for rid in member_ids]
             container_scores[cid] = compute_container_score(member_scores)
 
-        # Step 3 — atomically write new snapshot (invariant A-5)
+        # Step 3 — write the new snapshot (invariant A-5).
         self._current_version += 1
         snapshot = ReputationSnapshot(
             version=self._current_version,
@@ -278,6 +309,13 @@ class SentinelCycle:
             resource_reputation=scores,
             container_reputation=container_scores,
         ).with_checksum()
+
+        # Crash-consistency: persist state (which records _current_version) BEFORE
+        # making the snapshot visible. If we crash in between, state is AHEAD of the
+        # snapshot — the next run derives a fresh higher version — rather than behind
+        # it, which would re-emit THIS version with different content (a consumer
+        # would see two distinct snapshots at the same version).
+        self.save_state()
         atomic_swap(self._snapshot_dir, snapshot)
 
         log.info(
@@ -287,9 +325,6 @@ class SentinelCycle:
             len(container_scores),
             len(self._reputation_events),
         )
-
-        # Persist state so poisoning-mitigation counters and baselines survive restarts.
-        self.save_state()
 
         return snapshot
 

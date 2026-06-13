@@ -50,7 +50,7 @@ WITH neighbor,
 WITH neighbor,
      neighbor.suspicion_score + eff_weight * (1.0 - neighbor.suspicion_score) AS new_score
 SET neighbor.suspicion_score = CASE WHEN new_score > 1.0 THEN 1.0 ELSE new_score END
-SET neighbor.flagged = (new_score >= $flag_threshold)
+SET neighbor.flagged = (neighbor.suspicion_score >= $flag_threshold)
 SET neighbor.last_signal_at = timestamp()
 """
 

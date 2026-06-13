@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from axor_sentinel.graph.model import HOT_WEIGHTS, SignalType
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
@@ -7,7 +9,6 @@ from axor_sentinel.graph.model import HOT_WEIGHTS, SignalType
 FLAG_THRESHOLD: float = 0.7            # suspicion_score >= this → flagged=True
 BASE_CAUTION: float = 0.3             # base caution weight for adjacent resources
 CONTAINER_MEMBER_THRESHOLD: float = 0.2  # only members above this count toward container score
-REPUTATION_RULE_THRESHOLD: float = 0.8   # Phase 1 deterministic deny threshold
 
 
 # ── Core accumulation (logarithmic, invariant A-1) ─────────────────────────────
@@ -78,6 +79,45 @@ def origin_dampening(prior_count: int) -> float:
     return 0.5 ** prior_count
 
 
+@dataclass(frozen=True)
+class WeightFactors:
+    """Two views of one signal's weight, derived from a SINGLE computation of the
+    diversity/dampening factors so the in-memory accumulate and the Cypher pre-scale
+    cannot drift.
+
+    effective:          raw * confidence * diversity * dampening — what the in-memory
+                        ``accumulate`` consumes for the snapshot.
+    without_confidence: raw * diversity * dampening — what the hot-weight Cypher gets;
+                        the query multiplies it by ``r.canonical_confidence`` itself,
+                        so passing the full effective weight would double-count
+                        confidence.
+    """
+    effective: float
+    without_confidence: float
+
+
+def compute_weight_factors(
+    raw_weight: float,
+    canonical_confidence: float,
+    signal_history: list[str],
+    current_source: str,
+    prior_count_from_source: int,
+) -> WeightFactors:
+    """Compute both weight views from ONE evaluation of diversity + dampening.
+
+    The in-memory path and the Neo4j path used to compute ``diversity * dampening``
+    independently (the cycle recomputed them inline for a hand-tuned pre-scale),
+    which could silently drift from ``compute_effective_weight``. Both now derive
+    from the same ``without_confidence`` here (invariant A-8)."""
+    div_factor = source_diversity_factor(signal_history, current_source)
+    damp_factor = origin_dampening(prior_count_from_source)
+    without_confidence = raw_weight * div_factor * damp_factor
+    return WeightFactors(
+        effective=without_confidence * canonical_confidence,
+        without_confidence=without_confidence,
+    )
+
+
 def compute_effective_weight(
     raw_weight: float,
     canonical_confidence: float,
@@ -91,11 +131,15 @@ def compute_effective_weight(
                          * canonical_confidence
                          * source_diversity_factor
                          * origin_dampening
-    (invariant A-8)
+    (invariant A-8). Thin wrapper over compute_weight_factors().
     """
-    div_factor = source_diversity_factor(signal_history, current_source)
-    damp_factor = origin_dampening(prior_count_from_source)
-    return raw_weight * canonical_confidence * div_factor * damp_factor
+    return compute_weight_factors(
+        raw_weight=raw_weight,
+        canonical_confidence=canonical_confidence,
+        signal_history=signal_history,
+        current_source=current_source,
+        prior_count_from_source=prior_count_from_source,
+    ).effective
 
 
 # ── Hot weight computation ─────────────────────────────────────────────────────
@@ -103,25 +147,6 @@ def compute_effective_weight(
 def compute_hot_weight(signal_type: SignalType) -> float:
     """Return raw hot weight for the given signal type."""
     return HOT_WEIGHTS[signal_type]
-
-
-# ── Caution weight computation ─────────────────────────────────────────────────
-
-def compute_caution_weight(
-    topology_factor: float,
-    days_since_last_decay: float,
-    canonical_confidence: float,
-) -> float:
-    """
-    Caution weight for a resource adjacent to a hot resource:
-        effective = BASE_CAUTION * topology_factor * time_decay * canonical_confidence
-
-    Note: canonical_confidence scaling is applied here (it is part of effective_weight,
-    invariant A-8). The base formula uses time_decay against last_decay_at of the
-    neighbor (not the hot resource).
-    """
-    decay = time_decay(days_since_last_decay)
-    return BASE_CAUTION * topology_factor * decay * canonical_confidence
 
 
 # ── Container aggregation ──────────────────────────────────────────────────────

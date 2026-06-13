@@ -1,25 +1,41 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Mapping, Protocol, Sequence, runtime_checkable
 
+from axor_sentinel.graph.derive import derive_container_id, derive_resource_info
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.graph.normalizer import normalize_resource_id
-from axor_sentinel.integration.intent_enricher import (
-    _derive_container_id,
-    derive_resource_info,
-)
 from axor_sentinel.sentinel.cycle import ResourceAccess, SessionSummary
 
-if TYPE_CHECKING:
-    # Lazy / type-only reference to axor-core's neutral observation contract.
-    # axor-sentinel attaches to core only by *structural* Protocol compatibility
-    # (invariant P-34): we implement SessionSink's `on_session_closed` signature
-    # without a hard runtime import edge. This mirrors the TYPE_CHECKING-only
-    # core import already used in integration/intent_enricher.py.
-    from axor_core.contracts.observation import (  # type: ignore[import-untyped]
-        SessionAuditRecord,
-    )
+
+# Structural contract for a closed-session record from core. axor-core does NOT yet
+# emit such a record (there is no SessionSink / SessionAuditRecord in core today),
+# so this is a FORWARD integration: sentinel defines the shape it consumes here,
+# and a host adapter (or a future core observation contract) can satisfy it by
+# duck typing. Defining it sentinel-side keeps the attachment structural (invariant
+# P-34) and self-contained — no import edge into a core module that may not exist.
+@runtime_checkable
+class ToolInvocationRecord(Protocol):
+    tool: str
+    args: Mapping[str, object]
+    executed: bool
+
+
+@runtime_checkable
+class CoreSessionRecord(Protocol):
+    session_id: str
+    agent_id: str
+    started_at: float
+    taint_active: bool
+    taint_sources: Sequence[str]
+    event_kinds: Sequence[str]
+    tool_invocations: Sequence[ToolInvocationRecord]
+    # Authenticated source class core attests for poisoning-mitigation keying. Empty
+    # when core cannot attest one; sentinel then falls back to the agent_id (never to
+    # the attacker-controllable taint_source label). See F1 in architecture.md §10a.
+    source_class: str
+
 
 log = logging.getLogger("axor.sentinel.core_sink")
 
@@ -40,19 +56,19 @@ def _is_export_tool(tool: str) -> bool:
 
 class CoreSessionSink:
     """
-    Implements axor-core's ``SessionSink`` Protocol structurally.
+    Buckets a closed core session (``CoreSessionRecord``) into a ``SessionSummary``.
+
+    FORWARD INTEGRATION: axor-core does not yet emit a per-session record or call an
+    ``on_session_closed`` sink — there is no such contract in core today. This sink
+    is ready for when a host adapter (or a future core observation contract) hands
+    over closed sessions shaped like ``CoreSessionRecord`` (defined above,
+    sentinel-side). Until then it has no producer and is exercised only by tests.
 
     The counterpart to ``ProbeTaintBridge``, but for *full* core sessions rather
-    than just probe-flagged ones. Core emits a neutral, raw-facts
-    ``SessionAuditRecord`` per closed session via ``on_session_closed``; this sink
-    buckets those raw facts into a sentinel ``SessionSummary`` (deriving had_taint,
-    had_export_attempt, had_failed_export, had_escalation and graded
-    ``ResourceAccess`` entries) and buffers it for the next audit cycle.
-
-    This is the "consumer does the bucketing" side: core hands over only raw
-    ``taint_active`` / ``taint_sources`` / ``event_kinds`` / ``tool_invocations``,
-    and the sink translates them into sentinel vocabulary. It finally produces the
-    ``core_sessions`` list that ``ProbeTaintBridge``'s docstring references.
+    than just probe-flagged ones. Given a record's raw facts (``taint_active`` /
+    ``taint_sources`` / ``event_kinds`` / ``tool_invocations``) this sink derives
+    had_taint, had_export_attempt, had_failed_export, had_escalation and graded
+    ``ResourceAccess`` entries, and buffers a ``SessionSummary`` for the next cycle.
 
     The caller drains both buffers before each cycle::
 
@@ -62,8 +78,8 @@ class CoreSessionSink:
             container_members,
         )
 
-    axor-sentinel never imports axor-probe, and references the core observation
-    types under TYPE_CHECKING only — attachment is structural (invariant P-34).
+    axor-sentinel never imports axor-probe or axor-core here — the consumed shape is
+    a sentinel-defined structural Protocol (invariant P-34).
 
     Fail-safe: ``on_session_closed`` must never raise. On a mapping error it logs
     and still buffers a minimal ``SessionSummary`` (had_taint from the record's
@@ -76,7 +92,7 @@ class CoreSessionSink:
     def __init__(self) -> None:
         self._pending: list[SessionSummary] = []
 
-    async def on_session_closed(self, record: "SessionAuditRecord") -> None:
+    async def on_session_closed(self, record: "CoreSessionRecord") -> None:
         """
         Buffer a sentinel ``SessionSummary`` derived from a core audit record.
 
@@ -94,7 +110,7 @@ class CoreSessionSink:
             summary = self._minimal_summary(record)
         self._pending.append(summary)
 
-    def _map_record(self, record: "SessionAuditRecord") -> SessionSummary:
+    def _map_record(self, record: "CoreSessionRecord") -> SessionSummary:
         """Translate a raw core ``SessionAuditRecord`` into a ``SessionSummary``."""
         event_kinds = tuple(record.event_kinds)
         taint_sources = tuple(record.taint_sources)
@@ -131,6 +147,7 @@ class CoreSessionSink:
             had_escalation=had_escalation,
             accessed_resources=accessed_resources,
             taint_source=taint_source,
+            source_class=getattr(record, "source_class", "") or "",
         )
 
     def _map_access(self, inv, event_kinds: tuple[str, ...]) -> ResourceAccess:
@@ -150,7 +167,7 @@ class CoreSessionSink:
         """
         resource_info = derive_resource_info(inv.tool, inv.args)
         resource_id, _method, confidence = normalize_resource_id(resource_info)
-        container_id = _derive_container_id(
+        container_id = derive_container_id(
             resource_info.get("path", ""),
             resource_info.get("service", ""),
         )
@@ -171,7 +188,7 @@ class CoreSessionSink:
         )
 
     @staticmethod
-    def _minimal_summary(record: "SessionAuditRecord") -> SessionSummary:
+    def _minimal_summary(record: "CoreSessionRecord") -> SessionSummary:
         """
         Build a degraded-but-non-empty summary when full mapping fails.
 

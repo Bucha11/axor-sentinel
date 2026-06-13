@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 import warnings
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 log = logging.getLogger("axor.sentinel.snapshot")
@@ -126,7 +126,12 @@ def _serialize(snapshot: ReputationSnapshot) -> str:
 
 def _deserialize(text: str) -> ReputationSnapshot:
     data = json.loads(text)
-    return ReputationSnapshot(**data)
+    # Forward-compatible: ignore unknown top-level keys rather than raising on a
+    # snapshot written by a newer sentinel that added a field. Integrity is still
+    # enforced by checksum/signature over the reputation maps, which a stray field
+    # cannot alter.
+    known = {f.name for f in fields(ReputationSnapshot)}
+    return ReputationSnapshot(**{k: v for k, v in data.items() if k in known})
 
 
 def atomic_swap(snapshot_dir: Path, new_snapshot: ReputationSnapshot) -> None:
@@ -237,6 +242,19 @@ def load_snapshot(snapshot_dir: Path) -> ReputationSnapshot | None:
                 stacklevel=2,
             )
             return None
+        else:
+            # No key and not required: the snapshot is protected by checksum only,
+            # which any process with write access to the snapshot dir can recompute
+            # after tampering. Warn loudly so an operator running unauthenticated is
+            # aware — set AXOR_SNAPSHOT_KEY (and AXOR_SNAPSHOT_REQUIRE_SIGNATURE /
+            # AXOR_ENV=production) to fail closed on tampering.
+            warnings.warn(
+                "loading an UNAUTHENTICATED snapshot (checksum only, no HMAC): a "
+                f"writer to the snapshot dir can forge scores. Set {SNAPSHOT_KEY_ENV} "
+                "to authenticate.",
+                AuditIntegrityWarning,
+                stacklevel=2,
+            )
         return snapshot
     except Exception as exc:
         warnings.warn(
