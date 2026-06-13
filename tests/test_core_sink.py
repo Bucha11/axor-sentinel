@@ -52,6 +52,23 @@ def test_fake_record_satisfies_the_structural_contract():
     assert isinstance(_FakeInvocation(tool="x", args={}), ToolInvocationRecord)
 
 
+def test_pathless_egress_access_with_empty_resource_id_is_dropped():
+    # send_email(to=...) derives no path/provider -> empty resource id. Such accesses
+    # must NOT be buffered (they would all collide onto one empty-id resource node).
+    sink = CoreSessionSink()
+    record = _FakeRecord(
+        tool_invocations=(
+            _FakeInvocation(tool="send_email", args={"to": "x@y.z", "body": "hi"}),
+            _FakeInvocation(tool="fs_read", args={"path": "/data/r.txt"}),
+        ),
+    )
+    _run(sink.on_session_closed(record))
+    summary = sink.drain_pending()[0]
+    rids = [a.resource_id for a in summary.accessed_resources]
+    assert "" not in rids
+    assert len(summary.accessed_resources) == 1   # only the real read survived
+
+
 def test_read_only_session_maps_to_read_grade():
     sink = CoreSessionSink()
     record = _FakeRecord(

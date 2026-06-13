@@ -83,8 +83,14 @@ class SessionSummary:
         key on. Uses the authenticated source_class when present, else the agent_id —
         both are the *actor* identity, far harder to rotate than the taint_source
         label (which an attacker controls and could rotate to reset dampening). See
-        the F1 limitation in docs/architecture.md §10a."""
-        return self.source_class or self.agent_id or self.taint_source
+        the F1 limitation in docs/architecture.md §10a.
+
+        Falls back to a constant ("unattributed"), NEVER to taint_source: the whole
+        point of F1 is that the attacker-controllable label can never become the
+        dedup key. If both source_class and agent_id are empty, every such session
+        shares one conservative bucket (max dampening) rather than being splittable
+        by a rotated label."""
+        return self.source_class or self.agent_id or "unattributed"
 
 
 class SentinelCycle:
@@ -218,6 +224,12 @@ class SentinelCycle:
             # 2c — apply hot weights per accessed resource
             for access in session.accessed_resources:
                 rid = access.resource_id
+                # Skip accesses with no resolvable resource id (e.g. a path-less
+                # egress tool: send_email(to=...) derives no path/provider). Without
+                # this guard every such action collides onto a single empty-id node,
+                # inflating one meaningless bucket and polluting prior_counts.
+                if not rid:
+                    continue
                 raw_weight = compute_hot_weight(access.signal_type)
                 history = self._signal_history.get(rid, [])
                 prior = self._prior_counts.get((rid, origin), 0)

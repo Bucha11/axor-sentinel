@@ -93,6 +93,23 @@ def test_upsert_builds_graph_and_read_back_matches_accumulate(session):
     assert scores["r2"] == pytest.approx(accumulate(0.0, compute_hot_weight(SignalType.READ_EXPORT_FAILED) * 0.7))
 
 
+def test_score_clamp_is_two_sided(session):
+    # The CASE clamp must bound [0, 1] on its own, not rely on inputs being
+    # non-negative: a negative weight clamps to 0.0, an over-1 weight to 1.0.
+    session.run("MATCH (n) DETACH DELETE n")
+    session.run(
+        "MERGE (r:Resource {id:'r1'}) "
+        "SET r.suspicion_score=0.5, r.canonical_confidence=1.0, r.last_decay_at=timestamp() "
+        "MERGE (sn:Session {session_id:'s1', had_taint:true}) "
+        "MERGE (sn)-[:ACCESSED {signal_type:'read'}]->(r)"
+    )
+    q.apply_hot_weight(session, session_id="s1", signal_type="read", raw_weight=-10.0, flag_threshold=0.7)
+    assert session.run("MATCH (r:Resource {id:'r1'}) RETURN r.suspicion_score AS sc").single()["sc"] == 0.0
+    session.run("MATCH (r:Resource {id:'r1'}) SET r.suspicion_score=0.99")
+    q.apply_hot_weight(session, session_id="s1", signal_type="read", raw_weight=5.0, flag_threshold=0.7)
+    assert session.run("MATCH (r:Resource {id:'r1'}) RETURN r.suspicion_score AS sc").single()["sc"] == 1.0
+
+
 def test_hot_weight_and_fanout_match_python_accumulate(session):
     session.run("MATCH (n) DETACH DELETE n")
     session.run(

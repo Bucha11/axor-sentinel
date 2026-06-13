@@ -133,8 +133,12 @@ class CoreSessionSink:
         # when a denial is for a non-export intent — documented best-effort signal.
         had_failed_export = had_export_attempt and ("intent_denied" in event_kinds)
 
+        # Drop accesses with no resolvable resource id (a path-less egress tool such
+        # as send_email(to=...) derives no path/provider) — they would otherwise all
+        # collide onto a single empty-id resource node downstream.
         accessed_resources = [
-            self._map_access(inv, event_kinds) for inv in invocations
+            acc for acc in (self._map_access(inv, event_kinds) for inv in invocations)
+            if acc.resource_id
         ]
 
         return SessionSummary(

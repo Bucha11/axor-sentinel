@@ -399,6 +399,24 @@ class TestPoisoningMitigationKeying:
         cycle.run_once([_session("agentB", res, source_class="trusted-mcp")])
         assert cycle._prior_counts.get(("r1", "trusted-mcp")) == 2
 
+    def test_fallback_is_a_constant_never_the_taint_source(self, tmp_path: Path) -> None:
+        # With neither source_class nor agent_id, the key must be the constant
+        # "unattributed" — NEVER the attacker-controllable taint_source (F1).
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        cycle.run_once([_session("", res, taint_source="web")])
+        cycle.run_once([_session("", res, taint_source="mcp")])  # rotate the label
+        assert cycle._prior_counts.get(("r1", "unattributed")) == 2
+        assert ("r1", "web") not in cycle._prior_counts
+        assert ("r1", "mcp") not in cycle._prior_counts
+
+    def test_empty_resource_id_access_is_skipped(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        # An access with no resolvable resource id must not be scored or counted.
+        snap = cycle.run_once([_session("agentA", [("", "c1", 1.0, SignalType.READ)])])
+        assert "" not in snap.resource_reputation
+        assert cycle._prior_counts == {}
+
 
 class TestCrashConsistencyAndLocking:
     def test_state_persisted_before_snapshot_swap(self, tmp_path: Path, monkeypatch) -> None:
