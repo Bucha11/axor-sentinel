@@ -27,11 +27,9 @@ from axor_sentinel.sentinel.snapshot import (
 from axor_sentinel.sentinel.weight import (
     FLAG_THRESHOLD,
     accumulate,
-    compute_effective_weight,
+    compute_weight_factors,
     compute_hot_weight,
     compute_container_score,
-    origin_dampening,
-    source_diversity_factor,
 )
 
 log = logging.getLogger("axor.sentinel.cycle")
@@ -206,13 +204,17 @@ class SentinelCycle:
                 raw_weight = compute_hot_weight(access.signal_type)
                 history = self._signal_history.get(rid, [])
                 prior = self._prior_counts.get((rid, session.taint_source), 0)
-                eff_weight = compute_effective_weight(
+                # Single source for both weight views — the in-memory `effective`
+                # (fed to accumulate) and the Cypher `without_confidence` (the query
+                # multiplies by r.canonical_confidence) can no longer drift.
+                wf = compute_weight_factors(
                     raw_weight=raw_weight,
                     canonical_confidence=access.canonical_confidence,
                     signal_history=history,
                     current_source=session.taint_source,
                     prior_count_from_source=prior,
                 )
+                eff_weight = wf.effective
 
                 score_before = scores.get(rid, 0.0)
                 score_after = accumulate(score_before, eff_weight)
@@ -223,19 +225,14 @@ class SentinelCycle:
 
                 scores[rid] = score_after
 
-                # Apply to Neo4j.
-                # The Cypher query multiplies $raw_weight by r.canonical_confidence,
-                # so we pass a pre-scaled weight = raw_weight * diversity * dampening
-                # (everything except canonical_confidence) so the query result matches
-                # the in-memory effective_weight (invariant A-8).
-                div_f = source_diversity_factor(history, session.taint_source)
-                damp_f = origin_dampening(prior)
-                neo4j_raw = raw_weight * div_f * damp_f  # Cypher will multiply by canonical_confidence
+                # Mirror to Neo4j (next-cycle authoritative store). The hot-weight
+                # Cypher multiplies $raw_weight by r.canonical_confidence, so we hand
+                # it wf.without_confidence (raw * diversity * dampening).
                 q.apply_hot_weight(
                     self._neo4j,
                     session_id=session.session_id,
                     signal_type=access.signal_type.value,
-                    raw_weight=neo4j_raw,
+                    raw_weight=wf.without_confidence,
                     flag_threshold=FLAG_THRESHOLD,
                 )
 

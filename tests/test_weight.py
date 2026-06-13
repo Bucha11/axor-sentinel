@@ -21,11 +21,39 @@ from axor_sentinel.sentinel.weight import (
     compute_container_score,
     compute_effective_weight,
     compute_hot_weight,
+    compute_weight_factors,
     origin_dampening,
     source_diversity_factor,
     time_decay,
     update_resource_score,
 )
+
+
+class TestWeightFactorsSingleSource:
+    """The in-memory `effective` and the Cypher `without_confidence` derive from one
+    computation, so they can't drift (the dual-write reconciliation risk)."""
+
+    @pytest.mark.parametrize("conf", [0.4, 0.7, 1.0])
+    @pytest.mark.parametrize("history,source,prior", [
+        ([], "mcp", 0),
+        (["mcp", "mcp"], "mcp", 2),
+        (["web", "file"], "mcp", 0),
+    ])
+    def test_effective_equals_without_confidence_times_conf(self, conf, history, source, prior):
+        wf = compute_weight_factors(
+            raw_weight=0.8, canonical_confidence=conf,
+            signal_history=history, current_source=source, prior_count_from_source=prior,
+        )
+        assert wf.effective == pytest.approx(wf.without_confidence * conf)
+
+    def test_matches_compute_effective_weight(self):
+        kwargs = dict(
+            raw_weight=0.6, canonical_confidence=0.7,
+            signal_history=["mcp"], current_source="mcp", prior_count_from_source=1,
+        )
+        assert compute_weight_factors(**kwargs).effective == pytest.approx(
+            compute_effective_weight(**kwargs)
+        )
 
 
 # ── Graded hot signal ordering — 3 variants ────────────────────────────────────

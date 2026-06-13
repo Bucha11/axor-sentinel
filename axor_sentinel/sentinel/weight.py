@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from axor_sentinel.graph.model import HOT_WEIGHTS, SignalType
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
@@ -77,6 +79,45 @@ def origin_dampening(prior_count: int) -> float:
     return 0.5 ** prior_count
 
 
+@dataclass(frozen=True)
+class WeightFactors:
+    """Two views of one signal's weight, derived from a SINGLE computation of the
+    diversity/dampening factors so the in-memory accumulate and the Cypher pre-scale
+    cannot drift.
+
+    effective:          raw * confidence * diversity * dampening — what the in-memory
+                        ``accumulate`` consumes for the snapshot.
+    without_confidence: raw * diversity * dampening — what the hot-weight Cypher gets;
+                        the query multiplies it by ``r.canonical_confidence`` itself,
+                        so passing the full effective weight would double-count
+                        confidence.
+    """
+    effective: float
+    without_confidence: float
+
+
+def compute_weight_factors(
+    raw_weight: float,
+    canonical_confidence: float,
+    signal_history: list[str],
+    current_source: str,
+    prior_count_from_source: int,
+) -> WeightFactors:
+    """Compute both weight views from ONE evaluation of diversity + dampening.
+
+    The in-memory path and the Neo4j path used to compute ``diversity * dampening``
+    independently (the cycle recomputed them inline for a hand-tuned pre-scale),
+    which could silently drift from ``compute_effective_weight``. Both now derive
+    from the same ``without_confidence`` here (invariant A-8)."""
+    div_factor = source_diversity_factor(signal_history, current_source)
+    damp_factor = origin_dampening(prior_count_from_source)
+    without_confidence = raw_weight * div_factor * damp_factor
+    return WeightFactors(
+        effective=without_confidence * canonical_confidence,
+        without_confidence=without_confidence,
+    )
+
+
 def compute_effective_weight(
     raw_weight: float,
     canonical_confidence: float,
@@ -90,11 +131,15 @@ def compute_effective_weight(
                          * canonical_confidence
                          * source_diversity_factor
                          * origin_dampening
-    (invariant A-8)
+    (invariant A-8). Thin wrapper over compute_weight_factors().
     """
-    div_factor = source_diversity_factor(signal_history, current_source)
-    damp_factor = origin_dampening(prior_count_from_source)
-    return raw_weight * canonical_confidence * div_factor * damp_factor
+    return compute_weight_factors(
+        raw_weight=raw_weight,
+        canonical_confidence=canonical_confidence,
+        signal_history=signal_history,
+        current_source=current_source,
+        prior_count_from_source=prior_count_from_source,
+    ).effective
 
 
 # ── Hot weight computation ─────────────────────────────────────────────────────
