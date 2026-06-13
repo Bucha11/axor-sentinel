@@ -26,8 +26,8 @@ HOT_WEIGHT_QUERY = """
 MATCH (s:Session {had_taint: true, session_id: $session_id})
 MATCH (s)-[a:ACCESSED {signal_type: $signal_type}]->(r:Resource)
 WITH r, $raw_weight * r.canonical_confidence AS eff_weight
-SET r.suspicion_score = min(1.0,
-    r.suspicion_score + eff_weight * (1.0 - r.suspicion_score))
+WITH r, r.suspicion_score + eff_weight * (1.0 - r.suspicion_score) AS new_score
+SET r.suspicion_score = CASE WHEN new_score > 1.0 THEN 1.0 ELSE new_score END
 SET r.flagged = (r.suspicion_score >= $flag_threshold)
 SET r.last_signal_at = timestamp()
 """
@@ -47,9 +47,10 @@ WITH neighbor, tf,
      neighbor.canonical_confidence AS conf
 WITH neighbor,
      caution_weight * conf AS eff_weight
-SET neighbor.suspicion_score = min(1.0,
-    neighbor.suspicion_score + eff_weight * (1.0 - neighbor.suspicion_score))
-SET neighbor.flagged = (neighbor.suspicion_score >= $flag_threshold)
+WITH neighbor,
+     neighbor.suspicion_score + eff_weight * (1.0 - neighbor.suspicion_score) AS new_score
+SET neighbor.suspicion_score = CASE WHEN new_score > 1.0 THEN 1.0 ELSE new_score END
+SET neighbor.flagged = (new_score >= $flag_threshold)
 SET neighbor.last_signal_at = timestamp()
 """
 
@@ -59,7 +60,8 @@ SET neighbor.last_signal_at = timestamp()
 FANOUT_WEIGHT_QUERY = """
 UNWIND $resource_ids AS rid
 MATCH (r:Resource {id: rid})
-SET r.suspicion_score = min(1.0, r.suspicion_score + $fanout_weight * (1.0 - r.suspicion_score))
+WITH r, r.suspicion_score + $fanout_weight * (1.0 - r.suspicion_score) AS new_score
+SET r.suspicion_score = CASE WHEN new_score > 1.0 THEN 1.0 ELSE new_score END
 SET r.flagged = (r.suspicion_score >= $flag_threshold)
 SET r.last_signal_at = timestamp()
 """
