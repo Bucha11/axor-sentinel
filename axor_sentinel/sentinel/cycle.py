@@ -43,6 +43,42 @@ FANOUT_WEIGHT: float = 0.5          # flat weight added to all touched resources
 # Signal type that determines minimum threshold for fanout trigger (A-15)
 _FANOUT_MIN_SIGNAL = SignalType.READ_SUMMARIZE
 
+# topology_factor for resources sharing a container. A container is service+directory
+# (see graph.derive.derive_container_id), so co-members are "same directory / workspace"
+# — factor 1.0 (architecture.md §4). Finer tiers (same service 0.7, same namespace 0.6,
+# …) need a service/namespace map sentinel does not yet receive; container membership is
+# the topology source available today, and matches the bench topology pool.
+_SAME_CONTAINER_TOPOLOGY_FACTOR: float = 1.0
+
+
+def _build_adjacency_pairs(
+    container_members: dict[str, list[str]],
+) -> list[dict]:
+    """Directed ``ADJACENT_TO`` pairs for resources sharing a container.
+
+    Emits both directions per unordered pair (the caution query is directional), at
+    ``_SAME_CONTAINER_TOPOLOGY_FACTOR``. Empty ids and self-pairs are dropped, and
+    pairs are de-duplicated across containers.
+    """
+    seen: set[tuple[str, str]] = set()
+    pairs: list[dict] = []
+    for member_ids in container_members.values():
+        members = [r for r in member_ids if r]
+        for i, src in enumerate(members):
+            for tgt in members[i + 1:]:
+                if src == tgt:
+                    continue
+                for a, b in ((src, tgt), (tgt, src)):
+                    if (a, b) in seen:
+                        continue
+                    seen.add((a, b))
+                    pairs.append({
+                        "source": a,
+                        "target": b,
+                        "topology_factor": _SAME_CONTAINER_TOPOLOGY_FACTOR,
+                    })
+    return pairs
+
 
 @dataclass
 class ResourceAccess:
@@ -226,6 +262,13 @@ class SentinelCycle:
                 accesses=accesses,
             )
 
+        # Step 0b — topology: link resources sharing a container with ADJACENT_TO
+        # edges so the caution query has a graph to walk. Only existing Resource nodes
+        # are linked (MATCH-only), so an un-accessed neighbor must have been observed in
+        # a prior cycle to receive caution — exactly the cross-session signal intended.
+        adjacency_pairs = _build_adjacency_pairs(cmembers)
+        q.upsert_adjacency(self._neo4j, pairs=adjacency_pairs)
+
         # Step 1 — apply time decay (invariant A-4), now that all resources exist and
         # before any hot weight (so this cycle's signals are not decayed).
         q.apply_decay(self._neo4j, flag_threshold=FLAG_THRESHOLD)
@@ -297,8 +340,8 @@ class SentinelCycle:
                     flag_threshold=FLAG_THRESHOLD,
                 )
 
-            # 2e — caution weights to adjacent resources (inert until an ADJACENT_TO
-            # topology producer exists; see docs/deferred-followups.md §1).
+            # 2e — caution weights to topologically adjacent resources not directly
+            # accessed (ADJACENT_TO edges built in step 0b from container membership).
             q.apply_caution_adjacent(
                 self._neo4j,
                 session_id=session.session_id,

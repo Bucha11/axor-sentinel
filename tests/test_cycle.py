@@ -19,6 +19,7 @@ from axor_sentinel.sentinel.cycle import (
     ResourceAccess,
     SentinelCycle,
     SessionSummary,
+    _build_adjacency_pairs,
 )
 from axor_sentinel.sentinel.events import AgentContainerBaseline
 
@@ -130,6 +131,56 @@ class TestRunOnceHotWeights:
         hot_i = idx("ACCESSED {signal_type: $signal_type}")
         assert upsert_i is not None and decay_i is not None and hot_i is not None
         assert upsert_i < decay_i < hot_i
+
+
+# ── ADJACENT_TO topology producer ─────────────────────────────────────────────
+
+class TestAdjacencyTopology:
+    def test_build_pairs_links_co_container_members_both_ways(self) -> None:
+        pairs = _build_adjacency_pairs({"c1": ["r1", "r2", "r3"]})
+        # 3 members → 3 unordered pairs → 6 directed edges, all factor 1.0.
+        directed = {(p["source"], p["target"]) for p in pairs}
+        assert directed == {
+            ("r1", "r2"), ("r2", "r1"),
+            ("r1", "r3"), ("r3", "r1"),
+            ("r2", "r3"), ("r3", "r2"),
+        }
+        assert all(p["topology_factor"] == 1.0 for p in pairs)
+
+    def test_build_pairs_skips_empty_ids_and_singletons(self) -> None:
+        # A single-member container yields no edges; empty ids are dropped.
+        assert _build_adjacency_pairs({"c1": ["r1"]}) == []
+        pairs = _build_adjacency_pairs({"c1": ["r1", "", "r2"]})
+        assert {(p["source"], p["target"]) for p in pairs} == {("r1", "r2"), ("r2", "r1")}
+
+    def test_build_pairs_dedupes_across_containers(self) -> None:
+        # The same pair appearing in two containers is emitted once per direction.
+        pairs = _build_adjacency_pairs({"c1": ["r1", "r2"], "c2": ["r1", "r2"]})
+        assert len(pairs) == 2
+
+    def test_adjacency_upserted_after_construction_before_caution(self, tmp_path: Path) -> None:
+        """The ADJACENT_TO edges must be built after the nodes exist (upsert_session)
+        and before the caution query that walks them."""
+        cycle, neo4j = _cycle(tmp_path)
+        sess = _session("a", [("r1", "c1", 1.0, SignalType.READ)])
+        cycle.run_once([sess], container_members={"c1": ["r1", "r2"]})
+
+        qn = [q for q, _ in neo4j.calls]
+
+        def idx(fragment: str):
+            return next((i for i, q in enumerate(qn) if fragment in q), None)
+
+        upsert_i = idx("UNWIND $accesses")
+        adj_i = idx("MERGE (a)-[adj:ADJACENT_TO]->(b)")
+        caution_i = idx("[adj:ADJACENT_TO]->(neighbor:Resource)")
+        assert upsert_i is not None and adj_i is not None and caution_i is not None
+        assert upsert_i < adj_i < caution_i
+
+    def test_no_adjacency_query_without_container_members(self, tmp_path: Path) -> None:
+        # No container membership → no pairs → the adjacency write is skipped entirely.
+        cycle, neo4j = _cycle(tmp_path)
+        cycle.run_once([_session("a", [("r1", "c1", 1.0, SignalType.READ)])])
+        assert not neo4j.was_called_with("MERGE (a)-[adj:ADJACENT_TO]->(b)")
 
 
 # ── Fanout weight in snapshot (invariant A-10) ────────────────────────────────

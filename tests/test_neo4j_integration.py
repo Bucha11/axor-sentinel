@@ -52,6 +52,7 @@ _EXPLAIN_PARAMS = {
     "CAUTION_ADJACENT_QUERY": {"session_id": "x", "flag_threshold": 0.7},
     "FANOUT_WEIGHT_QUERY": {"resource_ids": ["r1"], "fanout_weight": 0.5, "flag_threshold": 0.7},
     "SLOW_AND_LOW_QUERY": {"min_gap_ms": 0.0},
+    "UPSERT_ADJACENCY_QUERY": {"pairs": [{"source": "r1", "target": "r2", "topology_factor": 1.0}]},
 }
 
 
@@ -140,6 +141,48 @@ class TestRunOnceLive:
             container_members={"c1": ["r1"]},
         )
         assert snap.container_reputation["c1"] > 0.0
+
+    def test_caution_boosts_unaccessed_container_neighbor(self, session, tmp_path):
+        # An un-accessed resource that shares a container with a hot resource gets a
+        # caution boost via ADJACENT_TO. The neighbor must already exist (observed in a
+        # prior cycle) for the topology edge — and the caution — to apply.
+        from axor_sentinel.graph.model import SignalType
+        cyc = self._cycle(session, tmp_path)
+        members = {"c1": ["r1", "r2"]}
+        # Cycle 1: both r1 and r2 observed (so r2's node exists for later adjacency).
+        cyc.run_once(
+            [self._sess("a", [("r1", "c1", 1.0, SignalType.READ),
+                              ("r2", "c1", 1.0, SignalType.READ)], session_id="s1")],
+            container_members=members,
+        )
+        r2_before = q.read_resource_scores(session)["r2"]
+        # Cycle 2: only r1 is accessed; r2 is an adjacent, un-accessed neighbor.
+        snap = cyc.run_once(
+            [self._sess("a", [("r1", "c1", 1.0, SignalType.READ)], session_id="s2")],
+            container_members=members,
+        )
+        # r2 was not accessed in cycle 2, yet its score rose from the caution weight.
+        assert snap.resource_reputation["r2"] > r2_before
+        # The ADJACENT_TO edge was actually created (both directions).
+        edges = session.run(
+            "MATCH (:Resource)-[adj:ADJACENT_TO]->(:Resource) RETURN count(adj) AS c"
+        ).single()["c"]
+        assert edges == 2
+
+    def test_caution_inert_without_shared_container(self, session, tmp_path):
+        # No container membership → no ADJACENT_TO edges → no caution on neighbors.
+        from axor_sentinel.graph.model import SignalType
+        cyc = self._cycle(session, tmp_path)
+        cyc.run_once(
+            [self._sess("a", [("r1", "c1", 1.0, SignalType.READ),
+                              ("r2", "c2", 1.0, SignalType.READ)], session_id="s1")],
+        )
+        r2_before = q.read_resource_scores(session)["r2"]
+        snap = cyc.run_once(
+            [self._sess("a", [("r1", "c1", 1.0, SignalType.READ)], session_id="s2")],
+        )
+        # Different containers: r2 gets no caution, only decay (score does not rise).
+        assert snap.resource_reputation["r2"] <= r2_before
 
     def test_fanout_boosts_score(self, session, tmp_path):
         from axor_sentinel.graph.model import SignalType

@@ -13,12 +13,13 @@ code, doc drift, and snapshot hardening (F7/F8) were already fixed.
 - **#2 concurrency/crash-consistency — DONE.** `run_once` is serialised by an
   instance lock; `save_state` now runs before `atomic_swap` (state ahead of snapshot
   on crash); version is in the signed state blob.
-- **#1 dual-write — DONE (Neo4j-authoritative read-back).** `run_once` now upserts the
-  graph, writes decay/hot/fanout/caution, and reads scores back from Neo4j to build
-  the snapshot — the in-memory accumulation (and the drift it risked) is gone. The
-  broken Cypher is fixed (two-sided `[0,1]` clamp) and the whole path is validated
-  end-to-end against a live Neo4j, run in CI via a `neo4j` service. Only `ADJACENT_TO`
-  topology for caution remains open (item 1 (b)).
+- **#1 dual-write — DONE (Neo4j-authoritative read-back, incl. caution topology).**
+  `run_once` now upserts the graph, writes decay/hot/fanout/caution, and reads scores
+  back from Neo4j to build the snapshot — the in-memory accumulation (and the drift it
+  risked) is gone. The broken Cypher is fixed (two-sided `[0,1]` clamp) and the whole
+  path is validated end-to-end against a live Neo4j, run in CI via a `neo4j` service.
+  Item 1 (b) — the `ADJACENT_TO` topology the caution query walks — is now produced
+  from container membership (`_build_adjacency_pairs`), so caution is live, not inert.
 - **#3 F1 anti-poisoning keying — DONE.** Dampening/diversity key on
   `mitigation_origin` (authenticated `source_class` if attested, else `agent_id`,
   else the constant `"unattributed"` — never `taint_source`). Item 3 records the
@@ -41,9 +42,16 @@ scores match the `accumulate` reference, accumulate across cycles, and flow into
 enricher. The mock-based cycle tests now assert orchestration + Python state only
 (the mock can't execute Cypher); score VALUES are asserted live.
 
-**Only remaining piece:** `apply_caution_adjacent` walks `ADJACENT_TO` edges that no
-producer creates, so caution stays inert until a topology source is added (item (b)
-below). That is a separate feature, not part of the read-back switch.
+**Caution topology (item (b)) — DONE.** `apply_caution_adjacent` walks `ADJACENT_TO`
+edges, which `_build_adjacency_pairs` now produces each cycle from container
+membership (co-members are "same directory / workspace", topology_factor 1.0). Edges
+are MERGEd both directions on already-observed Resource nodes (MATCH-only), so caution
+propagates to a known-but-not-accessed-this-cycle neighbor — the intended
+cross-session signal. Validated live
+(`TestRunOnceLive::test_caution_boosts_unaccessed_container_neighbor`). Finer
+topology_factor tiers (same service / namespace / project) need a service map sentinel
+does not yet receive; container membership is the source available today and matches
+the bench topology pool.
 
 Historical context (the bugs this surfaced):
 
@@ -63,9 +71,9 @@ Neo4j write path was not merely lagging — it was **non-functional**:
 The feature, as built: (a) a graph-construction layer — upsert
 `Session`/`Resource`/`Agent` nodes + `ACCESSED`/`IN_SESSION` edges per cycle
 (**done**: `upsert_session`); (b) a source for the `ADJACENT_TO` topology the caution
-query walks (**still open** — no producer, so caution is inert); (c) build the
-snapshot by reading scores back from Neo4j after all writes, deleting the Python
-re-accumulation (**done**). Validated with the live-Neo4j harness
+query walks (**done**: `_build_adjacency_pairs` from container membership, so caution
+is live); (c) build the snapshot by reading scores back from Neo4j after all writes,
+deleting the Python re-accumulation (**done**). Validated with the live-Neo4j harness
 (`AXOR_TEST_NEO4J_BOLT`), run in CI via a `neo4j` service.
 
 ## 2. Cycle concurrency & crash-consistency — DONE (see Status)
@@ -119,6 +127,7 @@ revision).
   threshold detection; documented in §10a. A decay floor for once-flagged resources
   and frozen-baseline-when-tainted would help but change detection behavior (false-
   positive risk), so left as tuning, not a code change.
-- **Model dataclasses are partly aspirational** (`DestinationNode`, `AdjacentToEdge`
-  never instantiated; `ADJACENT_TO` edges never written by sentinel, so the caution
-  query is inert without an external topology populator) — schema-as-doc; harmless.
+- **Model dataclasses are partly aspirational** (`DestinationNode` never instantiated;
+  `EXPORTED_TO`/`MEMBER_OF` edges not yet written) — schema-as-doc; harmless.
+  (`ADJACENT_TO` is now written each cycle from container membership — caution is no
+  longer inert.)

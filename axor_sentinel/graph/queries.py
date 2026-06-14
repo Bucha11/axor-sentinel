@@ -108,6 +108,20 @@ MERGE (r:Resource {id: acc.resource_id})
 MERGE (s)-[:ACCESSED {signal_type: acc.signal_type}]->(r)
 """
 
+# Build the ADJACENT_TO topology the caution query walks. Resources sharing a
+# container are "same directory / workspace" — topology_factor 1.0 (architecture.md
+# §4). MATCH (not MERGE) the endpoints: only link resources that already exist in the
+# graph (i.e. were observed in some cycle). A container member that has never been
+# accessed has no node — and no canonical_confidence / last_decay_at for the caution
+# math — so it is correctly left unlinked rather than fabricated as a bare node.
+UPSERT_ADJACENCY_QUERY = """
+UNWIND $pairs AS pair
+MATCH (a:Resource {id: pair.source})
+MATCH (b:Resource {id: pair.target})
+MERGE (a)-[adj:ADJACENT_TO]->(b)
+  SET adj.topology_factor = pair.topology_factor
+"""
+
 # Read the authoritative resource scores back after all writes — the source for the
 # snapshot when Neo4j is the system of record.
 READ_RESOURCE_SCORES_QUERY = """
@@ -142,6 +156,19 @@ def upsert_session(
         started_at=started_at,
         accesses=accesses,
     )
+
+
+def upsert_adjacency(session: Any, *, pairs: list[dict]) -> None:
+    """MERGE the ``ADJACENT_TO`` topology edges the caution query walks.
+
+    ``pairs`` is a list of ``{"source", "target", "topology_factor"}`` (directed —
+    the caution query traverses ``(hot)-[:ADJACENT_TO]->(neighbor)``, so the caller
+    emits both directions). Only existing Resource nodes are linked; an edge whose
+    endpoints have not both been observed is silently skipped.
+    """
+    if not pairs:
+        return
+    session.run(UPSERT_ADJACENCY_QUERY, pairs=pairs)
 
 
 def read_resource_scores(session: Any) -> dict[str, float]:

@@ -120,7 +120,7 @@ axor_sentinel/
 | Edge | Direction | Key properties | Notes |
 |---|---|---|---|
 | `:ACCESSED` | Session → Resource | `weight`, `signal_type`, `at` | Written per resource access. |
-| `:ADJACENT_TO` | Resource → Resource | `topology_factor` | Static topology; computed once on resource discovery. |
+| `:ADJACENT_TO` | Resource → Resource | `topology_factor` | Produced from container membership each cycle (`_build_adjacency_pairs`), both directions; co-members are "same directory / workspace" (factor 1.0). MATCH-only on existing resources. |
 | `:MEMBER_OF` | Resource → Container | — | Membership for container score aggregation. |
 | `:IN_SESSION` | Agent → Session | — | Links agent to its sessions for cross-session queries. |
 | `:EXPORTED_TO` | Session → Destination | — | Recorded on export attempt. |
@@ -317,8 +317,17 @@ Validated end-to-end against live Neo4j (`tests/test_neo4j_integration.py`, run 
 CI via a `neo4j` service): scores match the `accumulate` reference, accumulate across
 cycles, and flow through the snapshot into the enricher.
 
-**Remaining:** `apply_caution_adjacent` walks `ADJACENT_TO` edges, which nothing
-produces yet, so caution is **inert** until a topology producer exists.
+**Topology / caution:** `ADJACENT_TO` edges are now produced from container
+membership — resources sharing a container are "same directory / workspace"
+(topology_factor 1.0, §4). `_build_adjacency_pairs` emits both directions per
+co-member pair (step 0b, after construction, before the caution write); only
+already-observed Resource nodes are linked (MATCH-only), so caution propagates to a
+known-but-not-accessed-this-cycle neighbor — the intended cross-session signal.
+Finer tiers (same service 0.7, namespace 0.6, …) need a service/namespace map
+sentinel does not yet receive; container membership is the topology source available
+today (and matches the bench topology pool). Validated live
+(`TestRunOnceLive::test_caution_boosts_unaccessed_container_neighbor`).
+
 `ReputationEvent` evidence carries the cycle's pre/post read-back scores (not
 per-signal granularity). See `docs/deferred-followups.md §1`.
 
