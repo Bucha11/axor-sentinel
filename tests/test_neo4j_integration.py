@@ -93,6 +93,73 @@ def test_upsert_builds_graph_and_read_back_matches_accumulate(session):
     assert scores["r2"] == pytest.approx(accumulate(0.0, compute_hot_weight(SignalType.READ_EXPORT_FAILED) * 0.7))
 
 
+class TestRunOnceLive:
+    """run_once end-to-end against a real Neo4j: build graph -> write -> read back.
+    These pin the score VALUES the snapshot carries (the mock-based cycle tests can't,
+    since the mock does not execute Cypher)."""
+
+    @staticmethod
+    def _cycle(session, tmp_path, baselines=None):
+        from pathlib import Path
+        from axor_sentinel.sentinel.cycle import SentinelCycle
+        session.run("MATCH (n) DETACH DELETE n")
+        return SentinelCycle(session, Path(tmp_path), agent_baselines=baselines or {})
+
+    @staticmethod
+    def _sess(agent, resources, **kw):
+        from axor_sentinel.sentinel.cycle import ResourceAccess, SessionSummary
+        accesses = [ResourceAccess(resource_id=r, container_id=c, canonical_confidence=cf, signal_type=s)
+                    for r, c, cf, s in resources]
+        return SessionSummary(
+            session_id=kw.get("session_id", f"s_{agent}"), agent_id=agent,
+            started_at=1000.0, had_taint=kw.get("had_taint", True),
+            had_export_attempt=False, had_failed_export=False, had_escalation=False,
+            accessed_resources=accesses, taint_source=kw.get("taint_source", "mcp"),
+        )
+
+    def test_tainted_session_produces_positive_score(self, session, tmp_path):
+        from axor_sentinel.graph.model import SignalType
+        cyc = self._cycle(session, tmp_path)
+        snap = cyc.run_once([self._sess("a", [("r1", "c1", 1.0, SignalType.READ)])])
+        assert snap.resource_reputation["r1"] > 0.0
+
+    def test_higher_signal_produces_higher_score(self, session, tmp_path):
+        from axor_sentinel.graph.model import SignalType
+        cyc = self._cycle(session, tmp_path)
+        snap = cyc.run_once([
+            self._sess("a", [("r1", "c1", 1.0, SignalType.READ),
+                             ("r2", "c1", 1.0, SignalType.READ_EXPORT_FAILED)]),
+        ])
+        assert snap.resource_reputation["r2"] > snap.resource_reputation["r1"]
+
+    def test_container_scores_from_readback(self, session, tmp_path):
+        from axor_sentinel.graph.model import SignalType
+        cyc = self._cycle(session, tmp_path)
+        snap = cyc.run_once(
+            [self._sess("a", [("r1", "c1", 1.0, SignalType.READ_EXPORT_FAILED)])],
+            container_members={"c1": ["r1"]},
+        )
+        assert snap.container_reputation["c1"] > 0.0
+
+    def test_fanout_boosts_score(self, session, tmp_path):
+        from axor_sentinel.graph.model import SignalType
+        from axor_sentinel.sentinel.cycle import FANOUT_MIN_SESSIONS
+        from axor_sentinel.sentinel.events import AgentContainerBaseline
+        agent = "fan"
+        baseline = AgentContainerBaseline(
+            agent_id=agent, mean_containers_per_session=1.0, std_containers_per_session=0.5,
+            session_count=FANOUT_MIN_SESSIONS, last_updated=0.0,
+        )
+        # baseline-less run: hot weight only
+        plain = self._cycle(session, tmp_path / "plain")
+        snap_plain = plain.run_once([self._sess(agent, [("r0", "c0", 1.0, SignalType.READ_SUMMARIZE)])])
+        # fanout run: 10 containers -> z >> 2.5 -> fanout boost on top of hot weight
+        fan = self._cycle(session, tmp_path / "fan", baselines={agent: baseline})
+        res = [(f"r{i}", f"c{i}", 1.0, SignalType.READ_SUMMARIZE) for i in range(10)]
+        snap_fan = fan.run_once([self._sess(agent, res)])
+        assert snap_fan.resource_reputation["r0"] > snap_plain.resource_reputation["r0"]
+
+
 def test_score_clamp_is_two_sided(session):
     # The CASE clamp must bound [0, 1] on its own, not rely on inputs being
     # non-negative: a negative weight clamps to 0.0, an over-1 weight to 1.0.

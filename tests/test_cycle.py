@@ -32,8 +32,13 @@ class _MockNeo4j:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
 
-    def run(self, query: str, **params) -> None:  # noqa: ANN001
+    def run(self, query: str, **params):  # noqa: ANN001, ANN201
         self.calls.append((query, params))
+        # Cypher is not executed by the mock, so the read-back returns nothing — the
+        # snapshot is empty under the mock. Tests that assert score *values* use the
+        # live Neo4j (tests/test_neo4j_integration.py); the mock-based tests assert
+        # orchestration (queries issued/order) and Python state (prior_counts, etc.).
+        return []
 
     def was_called_with(self, fragment: str) -> bool:
         return any(fragment in q for q, _ in self.calls)
@@ -87,14 +92,10 @@ def _cycle(tmp_path: Path, baselines: dict | None = None) -> tuple[SentinelCycle
 # ── End-to-end hot weight accumulation ───────────────────────────────────────
 
 class TestRunOnceHotWeights:
-    def test_tainted_session_increments_score(self, tmp_path: Path) -> None:
-        """run_once with a tainted session must produce a positive reputation score."""
-        cycle, _ = _cycle(tmp_path)
-        sess = _session("agent1", [("r1", "c1", 1.0, SignalType.READ)])
-        snap = cycle.run_once([sess])
-
-        assert "r1" in snap.resource_reputation
-        assert snap.resource_reputation["r1"] > 0.0
+    # Score-VALUE assertions moved to the live-Neo4j suite (tests/test_neo4j_integration.py
+    # ::TestRunOnceLive) now that Neo4j is the system of record and the snapshot is read
+    # back from it. The mock does not execute Cypher, so under it the snapshot is empty;
+    # these mock-based tests assert orchestration and Python state only.
 
     def test_untainted_session_leaves_score_at_zero(self, tmp_path: Path) -> None:
         """Sessions without taint must not affect resource scores."""
@@ -104,28 +105,6 @@ class TestRunOnceHotWeights:
 
         assert snap.resource_reputation.get("r1", 0.0) == 0.0
 
-    def test_higher_signal_type_produces_higher_score(self, tmp_path: Path) -> None:
-        """READ_EXPORT_FAILED session → higher score than READ-only session."""
-        cycle_read, _ = _cycle(tmp_path / "read")
-        snap_read = cycle_read.run_once([
-            _session("a", [("r1", "c1", 1.0, SignalType.READ)])
-        ])
-
-        cycle_fail, _ = _cycle(tmp_path / "fail")
-        snap_fail = cycle_fail.run_once([
-            _session("a", [("r1", "c1", 1.0, SignalType.READ_EXPORT_FAILED)])
-        ])
-
-        assert snap_fail.resource_reputation["r1"] > snap_read.resource_reputation["r1"]
-
-    def test_container_scores_populated(self, tmp_path: Path) -> None:
-        """Container scores must be computed when container_members is provided."""
-        cycle, _ = _cycle(tmp_path)
-        sess = _session("a", [("r1", "c1", 1.0, SignalType.READ_SUMMARIZE)])
-        snap = cycle.run_once([sess], container_members={"c1": ["r1"]})
-
-        assert "c1" in snap.container_reputation
-
     def test_snapshot_is_frozen(self, tmp_path: Path) -> None:
         """ReputationSnapshot must be immutable (frozen=True)."""
         cycle, _ = _cycle(tmp_path)
@@ -133,18 +112,24 @@ class TestRunOnceHotWeights:
         with pytest.raises((AttributeError, TypeError)):
             snap.version = 999  # type: ignore[misc]
 
-    def test_decay_query_runs_first(self, tmp_path: Path) -> None:
-        """DECAY_QUERY must appear before HOT_WEIGHT_QUERY in the call log (invariant A-4)."""
+    def test_query_order_upsert_then_decay_then_hot(self, tmp_path: Path) -> None:
+        """Graph construction (upsert) precedes decay, which precedes hot weights
+        (invariant A-4: decay before this cycle's signals; construction first so the
+        queries have nodes to act on)."""
         cycle, neo4j = _cycle(tmp_path)
         sess = _session("a", [("r1", "c1", 1.0, SignalType.READ)])
         cycle.run_once([sess])
 
-        query_names = [q for q, _ in neo4j.calls]
-        decay_idx = next((i for i, q in enumerate(query_names) if "last_decay_at" in q and "suspicion_score" in q and "0.5" in q), None)
-        hot_idx = next((i for i, q in enumerate(query_names) if "last_signal_at" in q and "had_taint" in q), None)
-        assert decay_idx is not None, "DECAY_QUERY not found in Neo4j calls"
-        assert hot_idx is not None, "HOT_WEIGHT_QUERY not found in Neo4j calls"
-        assert decay_idx < hot_idx, "Decay must run before hot weights (invariant A-4)"
+        qn = [q for q, _ in neo4j.calls]
+
+        def idx(fragment: str):
+            return next((i for i, q in enumerate(qn) if fragment in q), None)
+
+        upsert_i = idx("UNWIND $accesses")
+        decay_i = idx("0.5 ^ (days_elapsed")
+        hot_i = idx("ACCESSED {signal_type: $signal_type}")
+        assert upsert_i is not None and decay_i is not None and hot_i is not None
+        assert upsert_i < decay_i < hot_i
 
 
 # ── Fanout weight in snapshot (invariant A-10) ────────────────────────────────
@@ -159,45 +144,28 @@ class TestFanoutWeightInSnapshot:
             last_updated=0.0,
         )
 
-    def test_fanout_boost_appears_in_snapshot(self, tmp_path: Path) -> None:
-        """
-        When a FanoutSignal fires, all touched resources must receive the extra
-        FANOUT_WEIGHT (0.5) accumulation on top of their hot weight.
-        The snapshot score must be higher than hot-weight-only.
-        """
+    def test_fanout_signal_fires_and_writes_fanout_weight(self, tmp_path: Path) -> None:
+        """A broad-access session over baseline fires a FanoutSignal and issues the
+        fanout-weight write. (The score boost it produces is asserted live in
+        tests/test_neo4j_integration.py::TestRunOnceLive.)"""
         agent = "fanout_agent"
         baseline = self._make_baseline(agent)
 
-        # Cycle WITHOUT fanout baseline (no fanout trigger)
+        # No baseline → no fanout signal.
         cycle_no_fanout, _ = _cycle(tmp_path / "no_fanout")
-        # Use only 1 container → z-score cannot exceed threshold
-        sess_no_fanout = _session(
-            agent,
-            [("r1", "c1", 1.0, SignalType.READ_SUMMARIZE)],
-            taint_source="src_a",
-        )
-        cycle_no_fanout.run_once([sess_no_fanout])
+        cycle_no_fanout.run_once([
+            _session(agent, [("r1", "c1", 1.0, SignalType.READ_SUMMARIZE)], taint_source="src_a")
+        ])
+        assert cycle_no_fanout._fanout_signals == []
 
-        # Cycle WITH fanout baseline (many containers → high z-score)
+        # With baseline + 10 containers → z = (10 - 1.0)/0.5 = 18 >> 2.5 → fanout fires.
         cycle_fanout, neo4j_fanout = _cycle(tmp_path / "fanout", baselines={agent: baseline})
-        # 10 unique containers → z = (10 - 1.0) / 0.5 = 18 >> 2.5
-        resources = [
-            (f"r{i}", f"c{i}", 1.0, SignalType.READ_SUMMARIZE)
-            for i in range(10)
-        ]
-        sess_fanout = _session(agent, resources, taint_source="src_a")
-        snap_fanout = cycle_fanout.run_once([sess_fanout])
+        resources = [(f"r{i}", f"c{i}", 1.0, SignalType.READ_SUMMARIZE) for i in range(10)]
+        cycle_fanout.run_once([_session(agent, resources, taint_source="src_a")])
 
-        # The fanout-boosted snapshot must have strictly higher scores for r0
-        # r0 in no_fanout session was "r1" (we used r1 there); check r0 in fanout snap
-        fanout_score = snap_fanout.resource_reputation.get("r0", 0.0)
-
-        # With FANOUT_WEIGHT=0.5 the score for r0 must be higher than the
-        # READ_SUMMARIZE hot weight alone (0.6 * 1.0 = 0.6 headroom contribution)
-        # after fanout: accumulate(0.6, 0.5) = 0.6 + 0.5*(1-0.6) = 0.8
-        assert fanout_score > 0.6, (
-            f"Expected fanout-boosted score > 0.6, got {fanout_score}"
-        )
+        assert len(cycle_fanout._fanout_signals) == 1
+        # The fanout-weight write was issued to Neo4j (UNWIND $resource_ids batch).
+        assert neo4j_fanout.was_called_with("UNWIND $resource_ids AS rid")
 
     def test_fanout_weight_written_to_neo4j(self, tmp_path: Path) -> None:
         """FANOUT_WEIGHT_QUERY must be sent to Neo4j when a fanout fires (invariant A-10)."""

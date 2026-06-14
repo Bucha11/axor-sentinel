@@ -295,26 +295,32 @@ Baseline is updated with exponential smoothing (α=0.3) after each session windo
 
 ---
 
-## 6a. Graph construction & read-back (read-back feature, in progress)
+## 6a. Graph construction & read-back (Neo4j is the system of record)
 
-Historically sentinel never created any graph nodes/edges, so the Cypher
-weight/decay/detection queries had nothing to MATCH and the **in-memory Python path
-was the only working scorer** (Neo4j writes were a mirror). Two building blocks now
-exist in `graph/queries.py`:
+`run_once` is **Neo4j-authoritative**: scores live in the graph, persist across
+cycles, and the snapshot is read back from Neo4j — there is no in-memory
+re-accumulation. The cycle proceeds:
 
-- `upsert_session` — MERGEs the `Agent`/`Session`/`Resource` nodes and
-  `IN_SESSION`/`ACCESSED` edges for a session (the construction layer the queries
-  need).
-- `read_resource_scores` — reads the accumulated scores back from Neo4j.
+1. **Construct** — `upsert_session` MERGEs the `Agent`/`Session`/`Resource` nodes
+   and `IN_SESSION`/`ACCESSED` edges for every session (the layer the queries need;
+   accesses with an empty resource id are skipped).
+2. **Decay** — `apply_decay` (after construction, before any hot weight).
+3. **Write** — per tainted session: `apply_hot_weight` (fed `wf.without_confidence`;
+   the query multiplies by `r.canonical_confidence`), `apply_fanout_weight`,
+   `apply_caution_adjacent`. The only weight computed in Python is the
+   diversity/dampening pre-scale — no parallel accumulate.
+4. **Read back** — `read_resource_scores` returns the authoritative scores; the
+   snapshot's `resource_reputation` is exactly this, and container scores are
+   recomputed from it. Decay and fanout are therefore reflected in the same cycle.
 
-The end state ("Neo4j is the system of record"): `run_once` would upsert → decay →
-hot/fanout/caution writes → `read_resource_scores` → snapshot, deleting the Python
-re-accumulation. **Status: building blocks landed and validated end-to-end against a
-live Neo4j (`tests/test_neo4j_integration.py`, run in CI via a `neo4j` service); but
-`run_once` is NOT yet rewired — it still builds the snapshot from the in-memory
-`scores` dict.** Remaining before the switch: a producer for the `ADJACENT_TO`
-topology (else the caution query stays inert), and converting the cycle's scoring
-tests to the live path. See `docs/deferred-followups.md §1`.
+Validated end-to-end against live Neo4j (`tests/test_neo4j_integration.py`, run in
+CI via a `neo4j` service): scores match the `accumulate` reference, accumulate across
+cycles, and flow through the snapshot into the enricher.
+
+**Remaining:** `apply_caution_adjacent` walks `ADJACENT_TO` edges, which nothing
+produces yet, so caution is **inert** until a topology producer exists.
+`ReputationEvent` evidence carries the cycle's pre/post read-back scores (not
+per-signal granularity). See `docs/deferred-followups.md §1`.
 
 ---
 

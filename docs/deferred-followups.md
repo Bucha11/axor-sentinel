@@ -13,13 +13,12 @@ code, doc drift, and snapshot hardening (F7/F8) were already fixed.
 - **#2 concurrency/crash-consistency — DONE.** `run_once` is serialised by an
   instance lock; `save_state` now runs before `atomic_swap` (state ahead of snapshot
   on crash); version is in the signed state blob.
-- **#1 dual-write — PARTIALLY DONE.** The hand-tuned pre-scale drift is gone:
-  `compute_weight_factors` is the single source for both the in-memory `effective`
-  weight and the Cypher `without_confidence`. Read-back FEATURE phase 1 has since
-  landed: the broken Cypher is fixed (two-sided `[0,1]` clamp), `upsert_session` +
-  `read_resource_scores` exist and are validated end-to-end against a live Neo4j (now
-  run in CI via a `neo4j` service). Still **not** done: rewiring `run_once` to the
-  read-back path (and an `ADJACENT_TO` topology producer for caution). Item 1 below.
+- **#1 dual-write — DONE (Neo4j-authoritative read-back).** `run_once` now upserts the
+  graph, writes decay/hot/fanout/caution, and reads scores back from Neo4j to build
+  the snapshot — the in-memory accumulation (and the drift it risked) is gone. The
+  broken Cypher is fixed (two-sided `[0,1]` clamp) and the whole path is validated
+  end-to-end against a live Neo4j, run in CI via a `neo4j` service. Only `ADJACENT_TO`
+  topology for caution remains open (item 1 (b)).
 - **#3 F1 anti-poisoning keying — DONE.** Dampening/diversity key on
   `mitigation_origin` (authenticated `source_class` if attested, else `agent_id`,
   else the constant `"unattributed"` — never `taint_source`). Item 3 records the
@@ -31,17 +30,22 @@ code, doc drift, and snapshot hardening (F7/F8) were already fixed.
 
 ---
 
-## 1. Dual-write scoring (in-memory dict ↔ Neo4j) — MAJOR (engineering risk) — REMAINING: read-back
+## 1. Dual-write scoring (in-memory dict ↔ Neo4j) — DONE (Neo4j-authoritative read-back)
 
-The pre-scale drift is fixed (see Status). What remains needs a live Neo4j:
+**Resolved.** `run_once` is now Neo4j-authoritative: it upserts the graph, applies
+decay + hot/fanout/caution writes, and **reads the scores back** from Neo4j to build
+the snapshot — the in-memory `scores` accumulation is gone, so there is no longer a
+second scorer to drift. Decay and fanout are reflected in the same-cycle snapshot.
+Validated end-to-end against live Neo4j (`tests/test_neo4j_integration.py::TestRunOnceLive`):
+scores match the `accumulate` reference, accumulate across cycles, and flow into the
+enricher. The mock-based cycle tests now assert orchestration + Python state only
+(the mock can't execute Cypher); score VALUES are asserted live.
 
-**Where:** `axor_sentinel/sentinel/cycle.py` `run_once`. Scores are maintained in two
-stores reconciled by convention: an in-memory `scores` dict (the snapshot source of
-truth) and Neo4j (the next-cycle source of truth). Hot-weight accumulation is done
-twice — once in Python (`weight.accumulate`) and once in Cypher (`HOT_WEIGHT_QUERY`)
-— with a hand-tuned pre-scaling so the two agree. **Caution weights and time-decay
-are applied only in Neo4j**, never to the in-memory `scores`, so the snapshot written
-*this* cycle omits caution/decay until the *next* cycle reads Neo4j back.
+**Only remaining piece:** `apply_caution_adjacent` walks `ADJACENT_TO` edges that no
+producer creates, so caution stays inert until a topology source is added (item (b)
+below). That is a separate feature, not part of the read-back switch.
+
+Historical context (the bugs this surfaced):
 
 **Discovered when a live Neo4j was finally run against the queries (5.26):** the
 Neo4j write path was not merely lagging — it was **non-functional**:
@@ -56,17 +60,13 @@ Neo4j write path was not merely lagging — it was **non-functional**:
    (Construction layer landed since: `upsert_session` in `graph/queries.py` now
    MERGEs the nodes/edges — but `run_once` is not yet rewired to it; see Status.)
 
-**So full "Neo4j-authoritative read-back" is a FEATURE, not a refactor.** It needs:
-(a) a graph-construction layer — upsert `Session`/`Resource`/`Agent` nodes +
-`ACCESSED`/`IN_SESSION` edges per cycle (**done**: `upsert_session`); (b) a source
-for the `ADJACENT_TO` topology the caution query walks (no producer in sentinel, so caution
-is inert regardless); (c) then build the snapshot by reading scores back from Neo4j
-after all writes, deleting the Python re-accumulation. Validate with the live-Neo4j
-test harness (`AXOR_TEST_NEO4J_BOLT`).
-
-**Done in this pass:** the hand-tuned pre-scale drift is gone (`compute_weight_factors`),
-and the broken Cypher is fixed + validated against a real server. The snapshot/Neo4j
-eventual-consistency for caution/decay remains (Python is authoritative).
+The feature, as built: (a) a graph-construction layer — upsert
+`Session`/`Resource`/`Agent` nodes + `ACCESSED`/`IN_SESSION` edges per cycle
+(**done**: `upsert_session`); (b) a source for the `ADJACENT_TO` topology the caution
+query walks (**still open** — no producer, so caution is inert); (c) build the
+snapshot by reading scores back from Neo4j after all writes, deleting the Python
+re-accumulation (**done**). Validated with the live-Neo4j harness
+(`AXOR_TEST_NEO4J_BOLT`), run in CI via a `neo4j` service.
 
 ## 2. Cycle concurrency & crash-consistency — DONE (see Status)
 
