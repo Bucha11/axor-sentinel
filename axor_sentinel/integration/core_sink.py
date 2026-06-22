@@ -12,12 +12,12 @@ from axor_sentinel.integration.intent_enricher import (
 from axor_sentinel.sentinel.cycle import ResourceAccess, SessionSummary
 
 if TYPE_CHECKING:
-    # Lazy / type-only reference to axor-core's neutral observation contract.
+    # Lazy / type-only reference to axor-core's closed-session audit contract.
     # axor-sentinel attaches to core only by *structural* Protocol compatibility
     # (invariant P-34): we implement SessionSink's `on_session_closed` signature
     # without a hard runtime import edge. This mirrors the TYPE_CHECKING-only
     # core import already used in integration/intent_enricher.py.
-    from axor_core.contracts.observation import (  # type: ignore[import-untyped]
+    from axor_core.contracts.session import (  # type: ignore[import-untyped]
         SessionAuditRecord,
     )
 
