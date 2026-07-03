@@ -28,6 +28,7 @@ from axor_sentinel.sentinel.predicates import (
     ReputationLevel,
     SentinelPolicy,
     evaluate_resource,
+    fanout_exceeded,
 )
 
 
@@ -48,6 +49,16 @@ def level_scenario(scenario: Scenario, policy: SentinelPolicy) -> bool:
         last_t = max(last_t, session.started_at)
         if not session.had_taint:
             continue
+        ranks = [SignalType(a.signal_type) for a in session.accessed_resources
+                 if a.signal_type in SignalType._value2member_map_]
+        if fanout_exceeded(
+            True,
+            (a.container_id for a in session.accessed_resources),
+            max(ranks) if ranks else None,
+            policy,
+            source_class=scenario.agent_profile,
+        ):
+            return True   # deterministic fanout quota — a session-level fact
         for access in session.accessed_resources:
             try:
                 rank = SignalType(access.signal_type)
@@ -142,7 +153,9 @@ def run_bench() -> tuple[dict[str, float], list[Scenario]]:
 # ── Predicate vs calibrated-score comparison ───────────────────────────────────
 
 def compare_predicates(scenarios: list[Scenario], scores: dict[str, float]) -> None:
-    policy = SentinelPolicy()
+    # Declared per-actor-class quotas (operator taxonomy, validated — not
+    # fitted: "narrow" is the bench's constrained support-agent class).
+    policy = SentinelPolicy(fanout_quota_overrides={"narrow": 2})
     flagged = {s.scenario_id: level_scenario(s, policy) for s in scenarios}
 
     def _rates(pred: dict[str, bool]) -> tuple[float, float, int, int]:

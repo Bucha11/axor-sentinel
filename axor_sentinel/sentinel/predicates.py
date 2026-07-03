@@ -34,7 +34,7 @@ anywhere on the path.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Iterable, Sequence
 
@@ -71,8 +71,18 @@ class SentinelPolicy:
     window_days: float = 30.0          # evidence TTL (replaces the decay half-life)
     staging_sessions: int = 3          # P3: distinct tainted sessions, rank ≥ READ_SUMMARIZE
     export_adjacent_origins: int = 2   # P2: distinct origins with EXPORT_ADJACENT
-    fanout_containers: int = 7         # quota: distinct containers in one tainted session
+    fanout_containers: int = 7         # default quota: distinct containers in one tainted session
     container_flagged_members: int = 2 # container FLAGGED at ≥ this many flagged members
+    # Per-actor-class quota overrides, keyed by the authenticated source_class
+    # core attests (SessionSummary.source_class). This is the DECLARED
+    # replacement for the self-trained per-agent baseline: "a narrow support
+    # agent has no business fanning out past 2 containers in a tainted
+    # session" is an auditable statement of the operator taxonomy, where the
+    # smoothed baseline was a statistic an attacker could walk upward.
+    fanout_quota_overrides: dict[str, int] = field(default_factory=dict)
+
+    def fanout_quota_for(self, source_class: str) -> int:
+        return self.fanout_quota_overrides.get(source_class, self.fanout_containers)
 
 
 @dataclass(frozen=True)
@@ -181,6 +191,7 @@ def fanout_exceeded(
     container_ids: Iterable[str],
     max_rank: SignalType | None,
     policy: SentinelPolicy,
+    source_class: str = "",
 ) -> bool:
     """Deterministic fanout quota (replaces the self-trained z-score baseline).
 
@@ -191,4 +202,4 @@ def fanout_exceeded(
     """
     if not tainted or max_rank is None or max_rank < _STAGING_MIN_RANK:
         return False
-    return len(set(container_ids)) > policy.fanout_containers
+    return len(set(container_ids)) > policy.fanout_quota_for(source_class)

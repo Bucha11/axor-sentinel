@@ -14,7 +14,7 @@ import pytest
 
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.cycle import (
-    FANOUT_MIN_SESSIONS,
+
     FANOUT_WEIGHT,
     ResourceAccess,
     SentinelCycle,
@@ -167,7 +167,7 @@ class TestFanoutWeightInSnapshot:
             agent_id=agent_id,
             mean_containers_per_session=1.0,
             std_containers_per_session=0.5,
-            session_count=FANOUT_MIN_SESSIONS,
+            session_count=10,
             last_updated=0.0,
         )
 

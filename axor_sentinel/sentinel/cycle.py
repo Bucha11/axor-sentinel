@@ -38,19 +38,17 @@ from axor_sentinel.sentinel.predicates import (
     Verdict,
     evaluate_container,
     evaluate_resource,
+    fanout_exceeded,
 )
 
 log = logging.getLogger("axor.sentinel.cycle")
 
-# Fanout detection parameters
-FANOUT_Z_THRESHOLD: float = 2.5
-FANOUT_MIN_SESSIONS: int = 10       # cold-start guard (invariant A-14)
-FANOUT_MIN_DELTA: int = 3           # absolute minimum above mean for low-std agents
-BASELINE_WINDOW_SESSIONS: int = 50  # sessions used to recompute baseline
+# Fanout parameters. The TRIGGER is the declared quota
+# (SentinelPolicy.fanout_containers, evaluated by predicates.fanout_exceeded);
+# the smoothed per-agent baseline below feeds the z-score TELEMETRY on emitted
+# signals only.
+BASELINE_WINDOW_SESSIONS: int = 50  # sessions used to recompute baseline (telemetry)
 FANOUT_WEIGHT: float = 0.5          # flat weight added to all touched resources (A-10)
-
-# Signal type that determines minimum threshold for fanout trigger (A-15)
-_FANOUT_MIN_SIGNAL = SignalType.READ_SUMMARIZE
 
 
 @dataclass
@@ -280,6 +278,9 @@ class SentinelCycle:
 
         self._reputation_events.clear()
         self._fanout_signals.clear()
+        # rid → fanout fact for this cycle's verdict bump (session-scoped burst;
+        # the windowed staging predicates P3/P4 carry the cross-cycle memory).
+        fanout_facts: dict[str, str] = {}
 
         # Step 2 — process each tainted session
         for session in sessions:
@@ -290,6 +291,12 @@ class SentinelCycle:
             fanout = self._check_fanout(session, now)
             if fanout is not None:
                 self._fanout_signals.append(fanout)
+                fact = (
+                    f"F1:fanout:session={session.session_id}"
+                    f":containers={fanout.unique_containers}"
+                )
+                for a in session.accessed_resources:
+                    fanout_facts.setdefault(a.resource_id, fact)
 
             # Poisoning-mitigation factors key on the actor identity (source_class or
             # agent_id), NOT the attacker-controllable taint_source label — rotating
@@ -407,7 +414,32 @@ class SentinelCycle:
             rid: evaluate_resource(self._evidence.evidence_for(rid), self._policy, now)
             for rid in self._evidence.resource_ids()
         }
+        # Fanout floor: every resource touched by a quota-exceeding session is
+        # at least WATCH this cycle, with the fanout fact attached.
+        for rid, fact in fanout_facts.items():
+            v = resource_verdicts.get(rid, Verdict(ReputationLevel.CLEAN))
+            level = v.level if v.level >= ReputationLevel.WATCH else ReputationLevel.WATCH
+            resource_verdicts[rid] = Verdict(level, v.facts + (fact,))
+
         resource_levels = {rid: v.level for rid, v in resource_verdicts.items()}
+
+        # Deterministic adjacency (replaces the numeric caution bleed): sharing
+        # a container with a FLAGGED resource is a structural fact worth WATCH —
+        # a label, not an arithmetic contribution.
+        for cid, member_ids in cmembers.items():
+            if any(
+                resource_levels.get(r, ReputationLevel.CLEAN) == ReputationLevel.FLAGGED
+                for r in member_ids
+            ):
+                for r in member_ids:
+                    if resource_levels.get(r, ReputationLevel.CLEAN) < ReputationLevel.WATCH:
+                        prior = resource_verdicts.get(r, Verdict(ReputationLevel.CLEAN))
+                        resource_verdicts[r] = Verdict(
+                            ReputationLevel.WATCH,
+                            prior.facts + (f"A1:adjacent_to_flagged:{cid}",),
+                        )
+        resource_levels = {rid: v.level for rid, v in resource_verdicts.items()}
+
         container_levels: dict[str, ReputationLevel] = {
             cid: evaluate_container(
                 (resource_levels.get(r, ReputationLevel.CLEAN) for r in member_ids),
@@ -462,60 +494,40 @@ class SentinelCycle:
         now: float,
     ) -> FanoutSignal | None:
         """
-        Check whether the session's container access pattern exceeds the agent's
-        historical baseline by FANOUT_Z_THRESHOLD standard deviations.
+        Deterministic fanout quota (declared policy) — replaces the self-trained
+        z-score baseline as the trigger. A tainted session touching more than
+        policy.fanout_containers DISTINCT containers at rank >= READ_SUMMARIZE
+        is a fanout fact: exact counting against a declared quota. No cold
+        start (a quota needs no history) and no baseline an attacker can walk
+        upward — closes limitation F5 by construction.
 
-        All three conditions must be true (invariant A-15):
-          1. session.had_taint
-          2. z_score > FANOUT_Z_THRESHOLD
-          3. max signal_type >= READ_SUMMARIZE
-        Cold start: returns None if baseline.session_count < FANOUT_MIN_SESSIONS (A-14).
+        The taint and signal-rank gates (invariant A-15) are unchanged. The
+        z-score against the smoothed per-agent baseline is still computed on an
+        emitted signal, but as TELEMETRY only (0.0 when no baseline exists) —
+        it never gates the trigger.
         """
-        # Invariant A-15: had_taint is required for fanout detection
-        if not session.had_taint:
+        containers = {a.container_id for a in session.accessed_resources}
+        signal_values = [a.signal_type for a in session.accessed_resources]
+        max_signal = max(signal_values) if signal_values else None
+        if not fanout_exceeded(
+            session.had_taint, containers, max_signal, self._policy,
+            source_class=session.source_class,
+        ):
             return None
 
         baseline = self._baselines.get(session.agent_id)
-        # Cold-start guard (invariant A-14)
-        if baseline is None or baseline.session_count < FANOUT_MIN_SESSIONS:
-            return None
-
-        # Determine unique containers touched
-        containers = {a.container_id for a in session.accessed_resources}
-        unique_containers = len(containers)
-
-        # Signal type gate (invariant A-15): need at least READ_SUMMARIZE.
-        # max() uses SignalType.__gt__ which compares by explicit _rank — safe
-        # against enum reordering.
-        signal_values = [a.signal_type for a in session.accessed_resources]
-        if not signal_values:
-            return None
-        max_signal = max(signal_values)
-        if max_signal < _FANOUT_MIN_SIGNAL:
-            return None
-
-        # z-score calculation
-        std = baseline.std_containers_per_session
-        mean = baseline.mean_containers_per_session
-
-        # Low-std guard: require absolute delta > FANOUT_MIN_DELTA
-        if std < 0.01:
-            if unique_containers <= mean + FANOUT_MIN_DELTA:
-                return None
-            z_score = float("inf")
+        mean = baseline.mean_containers_per_session if baseline is not None else 0.0
+        if baseline is not None and baseline.std_containers_per_session >= 0.01:
+            z_score = (len(containers) - mean) / baseline.std_containers_per_session
         else:
-            z_score = (unique_containers - mean) / std
+            z_score = 0.0
 
-        if z_score <= FANOUT_Z_THRESHOLD:
-            return None
-
-        affected = [a.resource_id for a in session.accessed_resources]
         return FanoutSignal(
             origin_session_id=session.session_id,
             agent_id=session.agent_id,
             taint_source=session.taint_source,
-            affected_resources=affected,
-            unique_containers=unique_containers,
+            affected_resources=[a.resource_id for a in session.accessed_resources],
+            unique_containers=len(containers),
             baseline_mean=mean,
             z_score=z_score,
             window_minutes=0.0,
