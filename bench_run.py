@@ -23,6 +23,51 @@ from axor_sentinel.sentinel.weight import (
     accumulate,
     apply_decay_to_score,
 )
+from axor_sentinel.sentinel.evidence import Evidence, resolution_from_confidence
+from axor_sentinel.sentinel.predicates import (
+    ReputationLevel,
+    SentinelPolicy,
+    evaluate_resource,
+)
+
+
+# ── Deterministic predicate scorer (unfitted — declared policy constants) ──────
+
+def level_scenario(scenario: Scenario, policy: SentinelPolicy) -> bool:
+    """Replay a scenario through the deterministic verdict layer.
+
+    Returns True iff any resource ends the scenario FLAGGED. Unlike the score
+    path there is nothing to threshold: the predicates are declared, so this
+    is a fixed classifier — the bench MEASURES its FPR instead of tuning it.
+    """
+    conf = {r.resource_id: r.canonical_confidence for r in scenario.resources}
+    store: dict[str, list[Evidence]] = defaultdict(list)
+    last_t = 0.0
+
+    for session in sorted(scenario.sessions, key=lambda s: s.started_at):
+        last_t = max(last_t, session.started_at)
+        if not session.had_taint:
+            continue
+        for access in session.accessed_resources:
+            try:
+                rank = SignalType(access.signal_type)
+            except ValueError:
+                continue
+            rid = access.resource_id
+            store[rid].append(Evidence(
+                origin=session.agent_id,
+                session_id=session.session_id,
+                rank=rank,
+                tainted=True,
+                observed_at=session.started_at,
+                resolution=resolution_from_confidence(conf.get(rid, 0.4)),
+            ))
+
+    now = last_t + 1.0
+    return any(
+        evaluate_resource(evs, policy, now).level == ReputationLevel.FLAGGED
+        for evs in store.values()
+    )
 
 
 # ── In-memory scorer ───────────────────────────────────────────────────────────
@@ -93,11 +138,44 @@ def run_bench() -> tuple[dict[str, float], list[Scenario]]:
     return scores, scenarios
 
 
+
+# ── Predicate vs calibrated-score comparison ───────────────────────────────────
+
+def compare_predicates(scenarios: list[Scenario], scores: dict[str, float]) -> None:
+    policy = SentinelPolicy()
+    flagged = {s.scenario_id: level_scenario(s, policy) for s in scenarios}
+
+    def _rates(pred: dict[str, bool]) -> tuple[float, float, int, int]:
+        atk = [s for s in scenarios if s.label == "ATTACK"]
+        ben = [s for s in scenarios if s.label == "BENIGN"]
+        tp = sum(1 for s in atk if pred[s.scenario_id])
+        fp = sum(1 for s in ben if pred[s.scenario_id])
+        return tp / len(atk), fp / len(ben), tp, fp
+
+    tpr_p, fpr_p, tp_p, fp_p = _rates(flagged)
+    score_flag = {sid: sc >= 0.7 for sid, sc in scores.items()}
+    tpr_s, fpr_s, tp_s, fp_s = _rates(score_flag)
+
+    print("\n── predicates (declared, unfitted) vs score (calibrated 0.7) ──")
+    print(f"{'classifier':28} {'TPR':>7} {'FPR':>7} {'TP':>5} {'FP':>5}")
+    print(f"{'score >= 0.7 (calibrated)':28} {tpr_s:7.3f} {fpr_s:7.3f} {tp_s:5d} {fp_s:5d}")
+    print(f"{'predicates P1-P4 (declared)':28} {tpr_p:7.3f} {fpr_p:7.3f} {tp_p:5d} {fp_p:5d}")
+
+    # per attack class
+    classes = sorted({s.attack_class for s in scenarios if s.attack_class})
+    print(f"\n{'attack_class':24} {'n':>4} {'pred TPR':>9} {'score TPR':>10}")
+    for cls in classes:
+        subset = [s for s in scenarios if s.attack_class == cls]
+        tpr_pc = sum(1 for s in subset if flagged[s.scenario_id]) / len(subset)
+        tpr_sc = sum(1 for s in subset if score_flag[s.scenario_id]) / len(subset)
+        print(f"{cls:24} {len(subset):4d} {tpr_pc:9.3f} {tpr_sc:10.3f}")
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     scores, scenarios = run_bench()
     result = evaluate(scenarios, scores)
+    compare_predicates(scenarios, scores)
 
     # Per-threshold sweep for table
     labeled = [

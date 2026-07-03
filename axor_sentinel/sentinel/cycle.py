@@ -31,6 +31,14 @@ from axor_sentinel.sentinel.weight import (
     compute_hot_weight,
     compute_container_score,
 )
+from axor_sentinel.sentinel.evidence import EvidenceStore, evidence_from_session
+from axor_sentinel.sentinel.predicates import (
+    ReputationLevel,
+    SentinelPolicy,
+    Verdict,
+    evaluate_container,
+    evaluate_resource,
+)
 
 log = logging.getLogger("axor.sentinel.cycle")
 
@@ -113,6 +121,7 @@ class SentinelCycle:
         agent_baselines: dict[str, AgentContainerBaseline] | None = None,
         signal_history: dict[str, list[str]] | None = None,
         prior_counts: dict[tuple[str, str], int] | None = None,
+        policy: SentinelPolicy | None = None,
     ) -> None:
         """
         Args:
@@ -133,19 +142,23 @@ class SentinelCycle:
         # If explicit state is provided (tests / controlled init), use it directly.
         # Otherwise try to restore persisted state from disk so poisoning-mitigation
         # counters and agent baselines survive process restarts.
+        # Declared predicate constants for the deterministic verdict layer.
+        self._policy = policy or SentinelPolicy()
         if agent_baselines is not None or signal_history is not None or prior_counts is not None:
             self._baselines: dict[str, AgentContainerBaseline] = agent_baselines or {}
             self._signal_history: dict[str, list[str]] = signal_history or {}
             self._prior_counts: dict[tuple[str, str], int] = prior_counts or {}
             self._current_version: int = 0
+            self._evidence = EvidenceStore()
         else:
-            sh, pc, bl, ver = SentinelCycle.load_state(
+            sh, pc, bl, ver, ev = SentinelCycle.load_state(
                 self._snapshot_dir / "sentinel_state.json"
             )
             self._baselines = bl
             self._signal_history = sh
             self._prior_counts = pc
             self._current_version = ver
+            self._evidence = ev
             if ver > 0:
                 log.info("sentinel: restored persisted state version=%d", ver)
 
@@ -283,6 +296,18 @@ class SentinelCycle:
             # that label must not reset dampening/diversity (F1).
             origin = session.mitigation_origin
 
+            # Deterministic verdict layer: record this session's typed facts.
+            # Dedup by (session, rank) inside the store; predicates count
+            # distinct origins/sessions, so replays cannot inflate verdicts.
+            for rid, ev in evidence_from_session(
+                origin=origin,
+                session_id=session.session_id,
+                started_at=session.started_at,
+                tainted=session.had_taint,
+                accesses=session.accessed_resources,
+            ):
+                self._evidence.add(rid, ev)
+
             # 2c — apply hot weights per accessed resource
             for access in session.accessed_resources:
                 rid = access.resource_id
@@ -373,6 +398,24 @@ class SentinelCycle:
             member_scores = [final_scores.get(rid, 0.0) for rid in member_ids]
             container_scores[cid] = compute_container_score(member_scores)
 
+        # Deterministic verdict layer (dual-run): windowed evidence → decidable
+        # levels + facts, published alongside the scalar maps. The scalar path
+        # above stays authoritative for the wire values in this phase; the
+        # levels are the predicate verdicts being validated against it.
+        self._evidence.prune(now, self._policy.window_days)
+        resource_verdicts: dict[str, Verdict] = {
+            rid: evaluate_resource(self._evidence.evidence_for(rid), self._policy, now)
+            for rid in self._evidence.resource_ids()
+        }
+        resource_levels = {rid: v.level for rid, v in resource_verdicts.items()}
+        container_levels: dict[str, ReputationLevel] = {
+            cid: evaluate_container(
+                (resource_levels.get(r, ReputationLevel.CLEAN) for r in member_ids),
+                self._policy,
+            ).level
+            for cid, member_ids in cmembers.items()
+        }
+
         # Step 3 — write the new snapshot (invariant A-5).
         self._current_version += 1
         snapshot = ReputationSnapshot(
@@ -380,6 +423,17 @@ class SentinelCycle:
             generated_at=now,
             resource_reputation=final_scores,
             container_reputation=container_scores,
+            resource_level={
+                rid: lvl.name.lower() for rid, lvl in resource_levels.items()
+                if lvl > ReputationLevel.CLEAN
+            },
+            container_level={
+                cid: lvl.name.lower() for cid, lvl in container_levels.items()
+                if lvl > ReputationLevel.CLEAN
+            },
+            verdict_facts={
+                rid: list(v.facts) for rid, v in resource_verdicts.items() if v.facts
+            },
         ).with_checksum()
 
         # Crash-consistency: persist state (which records _current_version) BEFORE
@@ -494,6 +548,9 @@ class SentinelCycle:
                     aid: dataclasses.asdict(b)
                     for aid, b in self._baselines.items()
                 },
+                # Deterministic verdict layer: windowed evidence sets survive
+                # restarts inside the same signed envelope.
+                "evidence": self._evidence.to_json(),
             }
             state_file = self._snapshot_dir / "sentinel_state.json"
             serialized = json.dumps(state, sort_keys=True, separators=(",", ":"))
@@ -521,21 +578,22 @@ class SentinelCycle:
         dict[tuple[str, str], int],
         dict[str, AgentContainerBaseline],
         int,
+        EvidenceStore,
     ]:
         """
         Load persisted sentinel state from ``state_path``.
 
-        Returns ``(signal_history, prior_counts, baselines, version)``.
+        Returns ``(signal_history, prior_counts, baselines, version, evidence)``.
         Returns empty dicts and version=0 if the file does not exist or is corrupt.
         """
         if not state_path.exists():
-            return {}, {}, {}, 0
+            return {}, {}, {}, 0, EvidenceStore()
         try:
             text = state_path.read_text(encoding="utf-8")
             obj = json.loads(text)
         except Exception as exc:
             log.warning("sentinel: failed to load state from %s: %s", state_path, exc)
-            return {}, {}, {}, 0
+            return {}, {}, {}, 0, EvidenceStore()
 
         # Authenticate before trusting. Signed envelope → verify HMAC; legacy
         # flat state → accept only when no key/signature is required (else cold
@@ -545,17 +603,17 @@ class SentinelCycle:
             serialized = obj.get("payload", "")
             if not verify_blob(serialized, obj.get("sig")):
                 log.warning("sentinel: state signature invalid — cold start")
-                return {}, {}, {}, 0
+                return {}, {}, {}, 0, EvidenceStore()
             try:
                 raw = json.loads(serialized)
             except Exception:
-                return {}, {}, {}, 0
+                return {}, {}, {}, 0, EvidenceStore()
         else:
             if not verify_blob(text, None):
                 log.warning(
                     "sentinel: unsigned state rejected (key/signature required) — cold start"
                 )
-                return {}, {}, {}, 0
+                return {}, {}, {}, 0, EvidenceStore()
             raw = obj
 
         signal_history: dict[str, list[str]] = raw.get("signal_history", {})
@@ -574,7 +632,8 @@ class SentinelCycle:
                 pass  # schema mismatch after upgrade — skip stale entry
 
         version = int(raw.get("version", 0))
-        return signal_history, prior_counts, baselines, version
+        evidence = EvidenceStore.from_json(raw.get("evidence", {}))
+        return signal_history, prior_counts, baselines, version, evidence
 
     def update_baseline(
         self,
