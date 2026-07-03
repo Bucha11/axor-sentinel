@@ -33,6 +33,7 @@ from axor_sentinel.sentinel.weight import (
 )
 from axor_sentinel.sentinel.evidence import EvidenceStore, evidence_from_session
 from axor_sentinel.sentinel.predicates import (
+    LEVEL_SUSPICION,
     ReputationLevel,
     SentinelPolicy,
     Verdict,
@@ -450,11 +451,24 @@ class SentinelCycle:
 
         # Step 3 — write the new snapshot (invariant A-5).
         self._current_version += 1
+        # The wire values are DERIVED from the decidable levels (finite
+        # codomain, covered by the checksum); the scalar accumulate/decay maps
+        # are demoted to telemetry fields.
         snapshot = ReputationSnapshot(
             version=self._current_version,
             generated_at=now,
-            resource_reputation=final_scores,
-            container_reputation=container_scores,
+            resource_reputation={
+                rid: LEVEL_SUSPICION[lvl]
+                for rid, lvl in resource_levels.items()
+                if lvl > ReputationLevel.CLEAN
+            },
+            container_reputation={
+                cid: LEVEL_SUSPICION[lvl]
+                for cid, lvl in container_levels.items()
+                if lvl > ReputationLevel.CLEAN
+            },
+            resource_score_telemetry=final_scores,
+            container_score_telemetry=container_scores,
             resource_level={
                 rid: lvl.name.lower() for rid, lvl in resource_levels.items()
                 if lvl > ReputationLevel.CLEAN

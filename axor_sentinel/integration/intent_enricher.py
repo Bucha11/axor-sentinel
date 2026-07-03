@@ -33,9 +33,14 @@ def _suspicion_to_reputation(suspicion: float) -> float:
     resources and ignore the suspicious ones. We invert: ``reputation = 1 - suspicion``.
 
     A 0.0 suspicion maps to 0.0 (core "unknown", no crossing); any positive suspicion
-    maps to ``1 - suspicion`` clamped above 0 so suspicion 1.0 still crosses. Operator
-    wiring: set ``detection_floor = 1 - FLAG_THRESHOLD`` (default 0.3) so a
-    sentinel-flagged resource (suspicion >= FLAG_THRESHOLD) crosses and tightens.
+    maps to ``1 - suspicion`` clamped above 0 so suspicion 1.0 still crosses.
+
+    The snapshot codomain is FINITE (LEVEL_SUSPICION: 0.0 clean / 0.4 watch /
+    1.0 flagged), so the conversion emits exactly {0.0, 0.6, 0.001}. Operator
+    wiring: ``detection_floor`` in (0.001, 0.6) tightens on FLAGGED only — the
+    long-standing 0.3 default keeps its exact meaning; a floor >= 0.6 also
+    tightens on WATCH. Decidable end-to-end: fact → predicate → level → finite
+    value → floor comparison, no calibrated threshold anywhere on the path.
     """
     if suspicion <= 0.0:
         return 0.0

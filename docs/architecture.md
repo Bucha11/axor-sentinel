@@ -134,6 +134,35 @@ axor_sentinel/
 
 ---
 
+## 4a. Deterministic verdict layer (authoritative)
+
+Since the deterministic rework, the VERDICT path is `sentinel/evidence.py` +
+`sentinel/predicates.py`: windowed typed evidence sets per resource, and
+declared decidable predicates over them —
+
+| Predicate | Fires when | Constant |
+|---|---|---|
+| P1 export-denied | an `EXPORT_FAILED` fact exists | — |
+| P2 export adjacency | `EXPORT_ADJACENT` facts from distinct origins | `export_adjacent_origins = 2` |
+| P3 staging count | distinct tainted sessions at rank ≥ READ_SUMMARIZE | `staging_sessions = 3` |
+| P4 staging sequence | read-under-taint, then a later export-adjacent touch | — |
+| fanout quota | > quota distinct containers in one tainted session | `fanout_containers = 7`, per-class overrides |
+
+Levels form a monotone lattice `CLEAN < WATCH < FLAGGED`; heuristic-resolved
+resource ids cap at WATCH; container verdicts count flagged members
+(`container_flagged_members = 2`); adjacency to a FLAGGED resource is a WATCH
+label. The snapshot's `resource_reputation` carries `LEVEL_SUSPICION[level]`
+(finite codomain 0.0 / 0.4 / 1.0) so core's `detection_floor` comparison is
+decidable end-to-end. Every constant is DECLARED policy (`SentinelPolicy`) —
+semantic and auditable, never fitted to a dataset; the bench VALIDATES the
+unfitted predicates (TPR 1.000 / FPR 0.000 on the 820-scenario baseline)
+instead of tuning a threshold. Anti-poisoning is set semantics: predicates
+count distinct `mitigation_origin`s, so same-actor repeats collapse.
+
+The scalar machinery below (§5) is retained as demoted TELEMETRY — the
+`resource_score_telemetry` snapshot fields and the graph's `suspicion_score`
+property; `FLAG_THRESHOLD` labels that telemetry and gates nothing.
+
 ## 5. Weight model
 
 All weight math lives in `sentinel/weight.py` — pure Python, no I/O, fully testable.
@@ -465,13 +494,17 @@ limitations below — a poisoned score cannot cause a wrong deny.
   itself is not authenticated upstream (no `source_class` attested), an attacker who
   can spin up distinct agent identities can still spread the count — bounded by
   observe-only core, and fully closed once core attests `source_class`.
-- **Time-decay wait-out.** Scores halve every 30 days with no floor for once-flagged
-  resources, so a slow-and-low attacker pacing staging beyond a decay half-life keeps
-  any single resource under threshold. The bench only exercises 7-day gaps.
-- **Fanout baseline is self-trained.** `_check_fanout` compares against the agent's
-  own smoothed baseline, which a patient attacker can walk upward ("boil the frog").
-  Cold-start (`session_count < 10`) and the `z <= 2.5` / `had_taint` guards are
-  threshold evasions inherent to the detector.
+- **Window wait-out (was: time-decay wait-out).** Verdicts are computed over a
+  declared sliding window (`SentinelPolicy.window_days`, default 30): evidence
+  either counts or has expired — the margin an attacker can wait out is now an
+  EXPLICIT, auditable policy constant instead of an exponential-decay side
+  effect. Pacing staging beyond the window still evades P3-style counting; the
+  P4 sequence predicate (staged-then-export on the same resource) fires
+  whenever both facts land inside one window regardless of pacing density.
+- **Fanout baseline: CLOSED.** The trigger is a declared per-actor-class quota
+  (`SentinelPolicy.fanout_quota_for(source_class)`), not the agent's smoothed
+  baseline — there is nothing to walk upward and no cold-start gap. The z-score
+  is computed as telemetry on emitted signals only.
 - **Snapshot/state authentication is opt-in.** HMAC engages only with
   `AXOR_SNAPSHOT_KEY` (fail-closed only under `AXOR_ENV=production` /
   `AXOR_SNAPSHOT_REQUIRE_SIGNATURE`). The default checksum-only mode is forgeable by

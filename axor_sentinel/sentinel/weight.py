@@ -6,7 +6,11 @@ from axor_sentinel.graph.model import HOT_WEIGHTS, SignalType
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
 
-FLAG_THRESHOLD: float = 0.7            # suspicion_score >= this → flagged=True
+# TELEMETRY ONLY since the deterministic verdict layer (predicates.py) became
+# authoritative: this labels the demoted scalar score in the graph/telemetry
+# maps. It gates nothing — verdicts are decidable predicates over evidence,
+# and the wire reputation values come from LEVEL_SUSPICION.
+FLAG_THRESHOLD: float = 0.7            # scalar-score telemetry label (not a verdict)
 BASE_CAUTION: float = 0.3             # base caution weight for adjacent resources
 CONTAINER_MEMBER_THRESHOLD: float = 0.2  # only members above this count toward container score
 
