@@ -63,6 +63,9 @@ class AttestationRecord:
     causal_root: str
     prior_heat: float
     revokes: str | None = None
+    # The Sentinel resource whose branch this attestation covers. The cycle keys
+    # attestations by it; the taint-graph scope is `causal_root` (spec 8.1.1).
+    resource_id: str = ""
 
 
 def validate(record: AttestationRecord) -> None:

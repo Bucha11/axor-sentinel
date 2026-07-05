@@ -18,6 +18,11 @@ from axor_sentinel.sentinel.events import (
     FanoutSignal,
     ReputationEvent,
 )
+from axor_sentinel.sentinel.attestation import (
+    AttestationRecord,
+    effective_score,
+    validate,
+)
 from axor_sentinel.sentinel.snapshot import (
     ReputationSnapshot,
     atomic_swap,
@@ -126,6 +131,11 @@ class SentinelCycle:
         self._snapshot_dir = Path(snapshot_dir)
         self._reputation_events: list[ReputationEvent] = []
         self._fanout_signals: list[FanoutSignal] = []
+        # Operator attestations, keyed by the resource whose branch they cover
+        # (UI spec 8.1.1). Append-only: an attestation lowers the score the
+        # snapshot exports via a downward recompute, it never mutates Neo4j —
+        # the graph stays the untouched evidence, laundering-proof.
+        self._attestations: dict[str, list[AttestationRecord]] = {}
         # Serialise cycles: run_once mutates _signal_history / _prior_counts /
         # _baselines / _current_version, none of which is safe under overlap.
         self._lock = threading.Lock()
@@ -153,6 +163,20 @@ class SentinelCycle:
         # Done in __init__ so operators learn about the misconfiguration at startup,
         # not at the first write hours later.
         validate_snapshot_dir(self._snapshot_dir)
+
+    # ── Operator attestations (UI spec 8.1.1) ──────────────────────────────────
+
+    def attest(self, record: AttestationRecord) -> None:
+        """Append an operator attestation over a resource branch. Reason and
+        operator are required (decision 8); nothing is deleted — the score the
+        snapshot exports descends via effective_score, the graph is untouched.
+        Revocation is a new record whose ``revokes`` names the prior one."""
+        validate(record)
+        with self._lock:
+            self._attestations.setdefault(record.resource_id, []).insert(0, record)
+
+    def attestations_for(self, resource_id: str) -> list[AttestationRecord]:
+        return list(self._attestations.get(resource_id, []))
 
     def run_once(
         self,
@@ -366,6 +390,17 @@ class SentinelCycle:
         # decay, hot weights, the fanout boost AND caution (which is written only to
         # the graph, never computed in Python) into one consistent snapshot.
         final_scores = q.read_resource_scores(self._neo4j)
+
+        # Apply operator attestations as a downward recompute over the read-back
+        # scores (UI spec 8.1.1): an attested branch reads its post-attestation
+        # residue, so a re-triggering value heats it right back up from that
+        # baseline. Neo4j is untouched — the evidence stays, only the exported
+        # reputation descends. Container scores below fold this in for free.
+        if self._attestations:
+            final_scores = {
+                rid: effective_score(score, self._attestations.get(rid, []))
+                for rid, score in final_scores.items()
+            }
 
         # 2f — recompute container scores from the read-back scores (invariant A-9).
         container_scores: dict[str, float] = {}
