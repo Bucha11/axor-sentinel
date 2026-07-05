@@ -31,6 +31,7 @@ MATCH (r:Resource {id: $resource_id})
 CREATE (a:Attestation {
     attestation_id: $attestation_id,
     operator: $operator,
+    org: $org,
     reason: $reason,
     causal_root: $causal_root,
     prior_heat: r.suspicion_score,
@@ -45,7 +46,7 @@ RETURN a.prior_heat AS prior_heat
 BRANCH_ATTESTATIONS_QUERY = """
 MATCH (a:Attestation {causal_root: $causal_root})-[:ATTESTS]->(r:Resource)
 RETURN a.attestation_id AS attestation_id, a.operator AS operator,
-       a.reason AS reason, a.prior_heat AS prior_heat,
+       a.org AS org, a.reason AS reason, a.prior_heat AS prior_heat,
        a.revokes AS revokes, a.created_at AS created_at
 ORDER BY a.created_at DESC
 """
@@ -66,6 +67,14 @@ class AttestationRecord:
     # The Sentinel resource whose branch this attestation covers. The cycle keys
     # attestations by it; the taint-graph scope is `causal_root` (spec 8.1.1).
     resource_id: str = ""
+    # Operator keyset / organisation. A revocation only takes effect when its org
+    # matches the org of the attestation it revokes (see effective_revocations):
+    # revoking an attestation RAISES the branch score back toward raw, so a
+    # cross-org operator honouring their own revocation would be a griefing /
+    # laundering-reversal channel. Empty org = unspecified: with no keyset model
+    # configured the check is a no-op (legacy behaviour), so single-org
+    # deployments are unaffected.
+    org: str = ""
 
 
 def validate(record: AttestationRecord) -> None:
@@ -75,14 +84,39 @@ def validate(record: AttestationRecord) -> None:
         raise AttestationError("attestation requires an operator identity")
 
 
+def _same_keyset(revoker: AttestationRecord, target: AttestationRecord) -> bool:
+    """A revocation is authorised only from the attesting keyset. When both orgs
+    are set they must match; when either is unset (no keyset model) the check is
+    a no-op and the revocation stands — single-org deployments keep working."""
+    if not revoker.org or not target.org:
+        return True
+    return revoker.org == target.org
+
+
+def effective_revocations(records: list[AttestationRecord]) -> set[str]:
+    """attestation_ids that are validly revoked — a revocation whose org matches
+    its target's. Cross-org revocations stay in history (append-only, nothing is
+    deleted) but do not change coverage."""
+    by_id = {r.attestation_id: r for r in records}
+    revoked: set[str] = set()
+    for r in records:
+        if r.revokes is None:
+            continue
+        target = by_id.get(r.revokes)
+        if target is not None and _same_keyset(r, target):
+            revoked.add(r.revokes)
+    return revoked
+
+
 def active_prior_heat(records: list[AttestationRecord]) -> float | None:
     """The prior_heat of the newest unrevoked attestation, or None.
 
     ``records`` newest-first (as BRANCH_ATTESTATIONS_QUERY returns them).
     Revocations are attestation events whose ``revokes`` names an earlier
-    attestation_id — nothing is deleted, coverage just changes.
+    attestation_id — nothing is deleted, coverage just changes — and only a
+    same-keyset revocation is honoured (effective_revocations).
     """
-    revoked = {r.revokes for r in records if r.revokes is not None}
+    revoked = effective_revocations(records)
     for record in records:
         if record.revokes is None and record.attestation_id not in revoked:
             return record.prior_heat

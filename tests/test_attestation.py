@@ -7,16 +7,19 @@ from axor_sentinel.sentinel.attestation import (
     AttestationError,
     AttestationRecord,
     active_prior_heat,
+    effective_revocations,
     effective_score,
     validate,
 )
 from axor_sentinel.sentinel.weight import accumulate
 
 
-def _rec(aid: str, prior: float, revokes: str | None = None) -> AttestationRecord:
+def _rec(
+    aid: str, prior: float, revokes: str | None = None, org: str = ""
+) -> AttestationRecord:
     return AttestationRecord(
         attestation_id=aid, operator="op_d", reason="investigated",
-        causal_root="root_1", prior_heat=prior, revokes=revokes,
+        causal_root="root_1", prior_heat=prior, revokes=revokes, org=org,
     )
 
 
@@ -66,3 +69,32 @@ def test_newest_unrevoked_attestation_wins() -> None:
 def test_bounds_are_clamped() -> None:
     assert effective_score(0.2, [_rec("a1", 0.8)]) == 0.0  # decayed below prior
     assert effective_score(1.0, [_rec("a1", 1.0)]) == 0.0
+
+
+def test_same_org_revocation_is_honoured() -> None:
+    records = [  # newest first
+        _rec("a2", 0.0, revokes="a1", org="acme"),
+        _rec("a1", 0.86, org="acme"),
+    ]
+    assert effective_revocations(records) == {"a1"}
+    assert active_prior_heat(records) is None
+    assert effective_score(0.86, records) == 0.86  # revoked → raw stands
+
+
+def test_cross_org_revocation_is_ignored() -> None:
+    # A rogue operator from another keyset cannot lift acme's attestation and
+    # re-heat the branch — the revocation stays in history but does not count.
+    records = [
+        _rec("a2", 0.0, revokes="a1", org="rogue"),
+        _rec("a1", 0.86, org="acme"),
+    ]
+    assert effective_revocations(records) == set()
+    assert active_prior_heat(records) == 0.86  # attestation still covers
+    assert effective_score(0.86, records) == pytest.approx(0.0)
+
+
+def test_unspecified_org_keeps_legacy_behaviour() -> None:
+    # No keyset model configured (empty orgs) → the guard is a no-op.
+    records = [_rec("a2", 0.0, revokes="a1"), _rec("a1", 0.86)]
+    assert effective_revocations(records) == {"a1"}
+    assert effective_score(0.86, records) == 0.86
