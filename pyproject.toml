@@ -7,13 +7,13 @@ name = "axor-sentinel"
 version = "0.1.0"
 description = "Cross-session behavioral analysis for Axor via weighted resource reputation graph"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 keywords = ["agents", "governance", "security", "reputation", "ai"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
