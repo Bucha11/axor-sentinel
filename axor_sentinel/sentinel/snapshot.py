@@ -82,8 +82,12 @@ class ReputationSnapshot:
 
     version:              monotonically increasing integer
     generated_at:         unix timestamp when the snapshot was written
-    resource_reputation:  resource_id → suspicion_score mapping
-    container_reputation: container_id → suspicion_score mapping
+    resource_reputation:  resource_id → suspicion, FINITE codomain — the values
+                          are LEVEL_SUSPICION[level] from the deterministic
+                          verdict layer (0.0 clean / 0.4 watch / 1.0 flagged),
+                          so core's detection_floor comparison is decidable
+                          end-to-end
+    container_reputation: container_id → suspicion, same finite codomain
     checksum:             SHA-256 of the serialized resource/container maps
     """
     version: int
@@ -92,6 +96,19 @@ class ReputationSnapshot:
     container_reputation: dict[str, float] = field(default_factory=dict)
     checksum: str = ""
     signature: str = ""
+    # Deterministic verdicts (predicates.py): id → level name, plus the facts
+    # behind each non-clean resource verdict. Forward-compatible: an older
+    # loader drops unknown keys. Once the deterministic codomain is
+    # authoritative, the reputation floats above are DERIVED from these levels,
+    # so integrity transfers through the checksummed maps.
+    resource_level: dict[str, str] = field(default_factory=dict)
+    container_level: dict[str, str] = field(default_factory=dict)
+    verdict_facts: dict[str, list[str]] = field(default_factory=dict)
+    # Demoted scalar scores (accumulate/decay path) — non-load-bearing
+    # telemetry, kept for observability while the deterministic levels are
+    # authoritative for the reputation maps above.
+    resource_score_telemetry: dict[str, float] = field(default_factory=dict)
+    container_score_telemetry: dict[str, float] = field(default_factory=dict)
 
     def _canonical_payload(self) -> bytes:
         return json.dumps(

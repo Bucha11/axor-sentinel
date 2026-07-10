@@ -14,7 +14,7 @@ import pytest
 
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.cycle import (
-    FANOUT_MIN_SESSIONS,
+
     FANOUT_WEIGHT,
     ResourceAccess,
     SentinelCycle,
@@ -167,7 +167,7 @@ class TestFanoutWeightInSnapshot:
             agent_id=agent_id,
             mean_containers_per_session=1.0,
             std_containers_per_session=0.5,
-            session_count=FANOUT_MIN_SESSIONS,
+            session_count=10,
             last_updated=0.0,
         )
 
@@ -283,7 +283,7 @@ class TestStatePersistence:
         cycle._current_version = 7
         cycle.save_state()
 
-        sh, pc, bl, ver = SentinelCycle.load_state(tmp_path / "sentinel_state.json")
+        sh, pc, bl, ver, ev = SentinelCycle.load_state(tmp_path / "sentinel_state.json")
 
         assert sh["r1"] == ["mcp", "web", "mcp"]
         assert pc[("r1", "mcp")] == 2
@@ -295,7 +295,7 @@ class TestStatePersistence:
 
     def test_missing_state_file_returns_empty(self, tmp_path: Path) -> None:
         """load_state on a non-existent file must return empty dicts and version 0."""
-        sh, pc, bl, ver = SentinelCycle.load_state(tmp_path / "nonexistent.json")
+        sh, pc, bl, ver, ev = SentinelCycle.load_state(tmp_path / "nonexistent.json")
         assert sh == {}
         assert pc == {}
         assert bl == {}
@@ -305,7 +305,7 @@ class TestStatePersistence:
         """Corrupt JSON must not raise — returns empty state."""
         bad_file = tmp_path / "sentinel_state.json"
         bad_file.write_text("{broken json", encoding="utf-8")
-        sh, pc, bl, ver = SentinelCycle.load_state(bad_file)
+        sh, pc, bl, ver, ev = SentinelCycle.load_state(bad_file)
         assert sh == {}
         assert ver == 0
 
@@ -393,7 +393,7 @@ class TestCrashConsistencyAndLocking:
             cycle.run_once([sess])
 
         # State was written (version 1) before the swap blew up.
-        _, _, _, ver = SentinelCycle.load_state(tmp_path / "sentinel_state.json")
+        _, _, _, ver, _ev = SentinelCycle.load_state(tmp_path / "sentinel_state.json")
         assert ver == 1
         # The snapshot never became visible.
         assert not (tmp_path / "snapshot_current").exists()

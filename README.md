@@ -15,14 +15,19 @@ sessions (axor-core)
         │
         ▼
   SentinelCycle          ← background audit, runs every ~1h
-  ├── time decay          ← scores halve every 30 days
-  ├── hot weights         ← READ=0.4 / READ_SUMMARIZE=0.6 / EXPORT_ADJACENT=0.8 / EXPORT_FAILED=1.0
-  ├── caution weights     ← adjacent resources get BASE_CAUTION=0.3 × topology_factor
-  ├── fanout detection    ← z-score vs agent's historical baseline (fires at z > 2.5)
+  ├── evidence sets       ← windowed typed facts per resource (30-day TTL, exact expiry)
+  ├── predicates P1–P4    ← declared, decidable: export-denied / distinct-origin
+  │                         export-adjacency / staging count / staged-then-export
+  ├── fanout quota        ← > N distinct containers in one tainted session
+  │                         (N declared per actor class — no self-trained baseline)
+  ├── adjacency labels    ← sharing a container with a FLAGGED resource ⇒ WATCH
   └── snapshot swap       ← atomic write to disk (symlink rename / os.replace)
         │
         ▼
-  ReputationSnapshot      ← flat dict resource_id → score, loaded at startup
+  ReputationSnapshot      ← resource_id → LEVEL_SUSPICION[level], a FINITE
+                            codomain (0.0 clean / 0.4 watch / 1.0 flagged) +
+                            level names and the facts behind each verdict;
+                            the old scalar scores ride along as telemetry
         │
         ▼
   SnapshotIntentEnricher  ← converts suspicion → trust, populates
@@ -30,7 +35,8 @@ sessions (axor-core)
         ▼
   IntentLoop (axor-core)  ← observe-only: records the reputation signal; with an
                             opt-in detection_floor it can only TIGHTEN degradation,
-                            never deny. (floor = 1 - flag_threshold)
+                            never deny. (floor in (0.001, 0.6) ⇒ FLAGGED-only;
+                            floor ≥ 0.6 ⇒ WATCH too — decidable end-to-end)
 ```
 
 > **Polarity note.** Sentinel scores *suspicion* (high = bad). Core's reputation

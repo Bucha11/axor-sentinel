@@ -2,7 +2,7 @@
 
 Dataset: **820 scenarios** (420 attack, 400 benign) — paper baseline, seed=42  
 Scorer: in-memory weight replay (no Neo4j)  
-Date: 2026-05-26
+Date: 2026-07-03
 
 ---
 

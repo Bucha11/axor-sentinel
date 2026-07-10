@@ -1,46 +1,32 @@
 """
-Adversarial tests for fanout detection.
+Adversarial tests for deterministic fanout detection.
 
-Covers invariants A-14, A-15 and spec adversarial test matrix:
-  - z-score threshold: z=2.0 no trigger, z=2.5 trigger, z=4.0 trigger
-  - Cold-start suppression: < 10 sessions never triggers
-  - Signal-type gate: read-only + high z-score does not trigger
-  - Low-std agent: std≈0 requires absolute delta > FANOUT_MIN_DELTA
+The trigger is the declared quota (SentinelPolicy.fanout_containers, default 7):
+a tainted session touching MORE than the quota of distinct containers at rank
+>= READ_SUMMARIZE fires. There is no cold start and no self-trained baseline to
+walk upward (F5 closed by construction); the z-score against the smoothed
+baseline is telemetry on the emitted signal only.
 """
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.cycle import (
-    FANOUT_MIN_DELTA,
-    FANOUT_MIN_SESSIONS,
-    FANOUT_Z_THRESHOLD,
     ResourceAccess,
     SentinelCycle,
     SessionSummary,
 )
 from axor_sentinel.sentinel.events import AgentContainerBaseline
+from axor_sentinel.sentinel.predicates import SentinelPolicy
 
+_QUOTA = SentinelPolicy().fanout_containers
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 class MockNeo4j:
     def run(self, q, **kw):
         pass
-
-
-def _make_baseline(
-    agent_id: str,
-    mean: float,
-    std: float,
-    session_count: int = FANOUT_MIN_SESSIONS,
-) -> AgentContainerBaseline:
-    return AgentContainerBaseline(
-        agent_id=agent_id,
-        mean_containers_per_session=mean,
-        std_containers_per_session=std,
-        session_count=session_count,
-        last_updated=0.0,
-    )
 
 
 def _make_session(
@@ -48,7 +34,6 @@ def _make_session(
     n_containers: int,
     signal_type: SignalType = SignalType.READ_SUMMARIZE,
     had_taint: bool = True,
-    had_export: bool = False,
 ) -> SessionSummary:
     accesses = [
         ResourceAccess(
@@ -64,7 +49,7 @@ def _make_session(
         agent_id=agent_id,
         started_at=0.0,
         had_taint=had_taint,
-        had_export_attempt=had_export,
+        had_export_attempt=False,
         had_failed_export=False,
         had_escalation=False,
         accessed_resources=accesses,
@@ -72,124 +57,93 @@ def _make_session(
     )
 
 
-def _cycle_with_baseline(
-    agent_id: str,
-    mean: float,
-    std: float,
-    session_count: int = FANOUT_MIN_SESSIONS,
-    tmpdir=None,
-) -> SentinelCycle:
-    import tempfile
-    from pathlib import Path
-    td = tmpdir or tempfile.mkdtemp()
-    baseline = _make_baseline(agent_id, mean, std, session_count)
+def _cycle(baselines=None) -> SentinelCycle:
     return SentinelCycle(
         MockNeo4j(),
-        Path(td),
-        agent_baselines={agent_id: baseline},
+        Path(tempfile.mkdtemp()),
+        agent_baselines=baselines or {},
     )
 
 
-# ── z-score threshold boundary — 3 variants ───────────────────────────────────
+class TestQuotaTrigger:
+    def test_at_quota_no_trigger(self):
+        cycle = _cycle()
+        s = _make_session("a", _QUOTA)
+        assert cycle._check_fanout(s, 0.0) is None
 
-class TestZScoreThreshold:
-    """Invariant A-15 condition: z_score > FANOUT_Z_THRESHOLD (2.5)."""
+    def test_above_quota_triggers(self):
+        cycle = _cycle()
+        s = _make_session("a", _QUOTA + 1)
+        sig = cycle._check_fanout(s, 0.0)
+        assert sig is not None
+        assert sig.unique_containers == _QUOTA + 1
 
-    def test_z_below_threshold_no_trigger(self, tmp_path):
-        """z=2.0 — does not trigger fanout."""
-        # With mean=5, std=1: unique_containers=7 → z=(7-5)/1=2.0
-        cycle = _cycle_with_baseline("a1", mean=5.0, std=1.0, tmpdir=tmp_path)
-        session = _make_session("a1", n_containers=7)
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is None
+    def test_no_baseline_still_triggers(self):
+        # No cold start: a quota needs no history (F5 closed by construction).
+        cycle = _cycle(baselines={})
+        sig = cycle._check_fanout(_make_session("newagent", _QUOTA + 3), 0.0)
+        assert sig is not None
+        assert sig.z_score == 0.0            # telemetry-only, no baseline
 
-    def test_z_at_threshold_no_trigger(self, tmp_path):
-        """z=2.5 exactly (not >) — does not trigger (strictly greater than)."""
-        # z = (unique - mean) / std = 2.5 exactly: unique=7.5 not integer; use unique=8, std=1, mean=5.5
-        cycle = _cycle_with_baseline("a2", mean=5.5, std=1.0, tmpdir=tmp_path)
-        session = _make_session("a2", n_containers=8)  # z=(8-5.5)/1=2.5 exactly
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is None  # must be strictly greater than 2.5
-
-    def test_z_above_threshold_triggers(self, tmp_path):
-        """z=4.0 — triggers fanout signal."""
-        # With mean=5, std=1: unique=9 → z=4.0
-        cycle = _cycle_with_baseline("a3", mean=5.0, std=1.0, tmpdir=tmp_path)
-        session = _make_session("a3", n_containers=9)
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is not None
-        assert fanout.z_score > FANOUT_Z_THRESHOLD
-
-
-# ── Cold-start suppression — 2 variants ───────────────────────────────────────
-
-class TestColdStartSuppression:
-    """Invariant A-14: agents with < FANOUT_MIN_SESSIONS never trigger fanout."""
-
-    def test_no_baseline_no_trigger(self, tmp_path):
-        """Agent with no baseline at all — cold start, no trigger."""
-        cycle = SentinelCycle(MockNeo4j(), tmp_path)  # no baselines
-        session = _make_session("new_agent", n_containers=100)
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is None
-
-    def test_insufficient_session_count_no_trigger(self, tmp_path):
-        """Agent with session_count=9 (< 10) — still cold start."""
-        cycle = _cycle_with_baseline(
-            "a_cold", mean=2.0, std=0.5, session_count=FANOUT_MIN_SESSIONS - 1,
-            tmpdir=tmp_path,
+    def test_custom_quota_respected(self):
+        cycle = SentinelCycle(
+            MockNeo4j(), Path(tempfile.mkdtemp()),
+            agent_baselines={}, policy=SentinelPolicy(fanout_containers=2),
         )
-        session = _make_session("a_cold", n_containers=50)
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is None
+        assert cycle._check_fanout(_make_session("a", 3), 0.0) is not None
+        assert cycle._check_fanout(_make_session("a", 2), 0.0) is None
 
 
-# ── Signal-type gate — 2 variants ─────────────────────────────────────────────
+class TestGates:
+    def test_untainted_never_triggers(self):
+        cycle = _cycle()
+        s = _make_session("a", _QUOTA + 5, had_taint=False)
+        assert cycle._check_fanout(s, 0.0) is None
 
-class TestSignalTypeGate:
-    """
-    Invariant A-15: fanout requires max_signal_type >= READ_SUMMARIZE.
-    A tainted session with only READ-level signals must not trigger.
-    """
+    def test_read_only_never_triggers(self):
+        # Signal-rank gate (A-15): plain READ fanout is not staging.
+        cycle = _cycle()
+        s = _make_session("a", _QUOTA + 5, signal_type=SignalType.READ)
+        assert cycle._check_fanout(s, 0.0) is None
 
-    def test_read_only_high_z_no_trigger(self, tmp_path):
-        """Read-only tainted session with z=5.0 does NOT trigger fanout."""
-        cycle = _cycle_with_baseline("a_ro", mean=2.0, std=0.5, tmpdir=tmp_path)
-        session = _make_session("a_ro", n_containers=10, signal_type=SignalType.READ)
-        # z = (10 - 2.0) / 0.5 = 16.0 — far above threshold
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is None
+    def test_read_summarize_triggers(self):
+        cycle = _cycle()
+        s = _make_session("a", _QUOTA + 1, signal_type=SignalType.READ_SUMMARIZE)
+        assert cycle._check_fanout(s, 0.0) is not None
 
-    def test_read_summarize_high_z_triggers(self, tmp_path):
-        """READ_SUMMARIZE session with high z-score DOES trigger."""
-        cycle = _cycle_with_baseline("a_sum", mean=2.0, std=0.5, tmpdir=tmp_path)
-        session = _make_session(
-            "a_sum", n_containers=10, signal_type=SignalType.READ_SUMMARIZE
+    def test_duplicate_containers_collapse(self):
+        cycle = _cycle()
+        accesses = [
+            ResourceAccess(f"r{i}", "same_container", 1.0, SignalType.READ_SUMMARIZE)
+            for i in range(_QUOTA * 3)
+        ]
+        s = SessionSummary(
+            session_id="s", agent_id="a", started_at=0.0, had_taint=True,
+            had_export_attempt=False, had_failed_export=False,
+            had_escalation=False, accessed_resources=accesses,
         )
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is not None
+        assert cycle._check_fanout(s, 0.0) is None
 
 
-# ── Low-std agent — 2 variants ────────────────────────────────────────────────
+class TestZScoreTelemetry:
+    def test_z_computed_when_baseline_exists(self):
+        baseline = AgentContainerBaseline(
+            agent_id="a", mean_containers_per_session=2.0,
+            std_containers_per_session=2.0, session_count=50, last_updated=0.0,
+        )
+        cycle = _cycle(baselines={"a": baseline})
+        sig = cycle._check_fanout(_make_session("a", _QUOTA + 1), 0.0)
+        assert sig is not None
+        assert sig.baseline_mean == 2.0
+        assert sig.z_score == ((_QUOTA + 1) - 2.0) / 2.0
 
-class TestLowStdAgent:
-    """
-    Agent with std≈0 (very predictable access pattern) uses absolute delta guard.
-    Requires current_unique_containers > baseline.mean + FANOUT_MIN_DELTA.
-    """
-
-    def test_low_std_below_absolute_delta_no_trigger(self, tmp_path):
-        """std≈0, unique_containers = mean + 2 (< FANOUT_MIN_DELTA=3) → no trigger."""
-        mean = 5.0
-        cycle = _cycle_with_baseline("a_etl", mean=mean, std=0.0, tmpdir=tmp_path)
-        session = _make_session("a_etl", n_containers=int(mean) + 2)
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is None
-
-    def test_low_std_above_absolute_delta_triggers(self, tmp_path):
-        """std≈0, unique_containers = mean + FANOUT_MIN_DELTA + 1 → triggers."""
-        mean = 5.0
-        cycle = _cycle_with_baseline("a_etl2", mean=mean, std=0.0, tmpdir=tmp_path)
-        session = _make_session("a_etl2", n_containers=int(mean) + FANOUT_MIN_DELTA + 1)
-        fanout = cycle._check_fanout(session, now=0.0)
-        assert fanout is not None
+    def test_z_never_gates_the_trigger(self):
+        # Huge baseline mean → z is negative, quota still fires: z is telemetry.
+        baseline = AgentContainerBaseline(
+            agent_id="a", mean_containers_per_session=100.0,
+            std_containers_per_session=5.0, session_count=50, last_updated=0.0,
+        )
+        cycle = _cycle(baselines={"a": baseline})
+        sig = cycle._check_fanout(_make_session("a", _QUOTA + 1), 0.0)
+        assert sig is not None
+        assert sig.z_score < 0

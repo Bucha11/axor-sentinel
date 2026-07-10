@@ -463,14 +463,18 @@ class TestFullCycleSnapshot:
     """
 
     def test_snapshot_reflects_neo4j_score(self, session, tmp_path) -> None:
-        """The snapshot score for a resource equals its Neo4j suspicion_score."""
+        """The Neo4j suspicion_score lands in the score-telemetry map; the wire
+        reputation carries the level-derived finite value (one tainted staging
+        session → WATCH → 0.4)."""
         cycle = SentinelCycle(session, tmp_path, agent_baselines={})
         sess = _summary("cs1", "a1", [_access("r1", "c1", SignalType.READ_SUMMARIZE)])
 
         snap = cycle.run_once([sess])
 
-        assert snap.resource_reputation["r1"] > 0.0
-        assert snap.resource_reputation["r1"] == pytest.approx(_score(session, "r1"))
+        assert snap.resource_score_telemetry["r1"] > 0.0
+        assert snap.resource_score_telemetry["r1"] == pytest.approx(_score(session, "r1"))
+        assert snap.resource_level["r1"] == "watch"
+        assert snap.resource_reputation["r1"] == pytest.approx(0.4)
 
     def test_untainted_session_leaves_score_at_zero(self, session, tmp_path) -> None:
         """An untainted session creates the node but applies no weight → absent (0)."""
@@ -495,7 +499,14 @@ class TestFullCycleSnapshot:
             [_summary("s_f", "a", [_access("rr", "c", SignalType.READ_EXPORT_FAILED)])]
         )
 
-        assert snap_fail.resource_reputation["rr"] > snap_read.resource_reputation["rr"]
+        # Scalar telemetry preserves the magnitude ordering...
+        assert (snap_fail.resource_score_telemetry["rr"]
+                > snap_read.resource_score_telemetry.get("rr", 0.0))
+        # ...and the decidable verdicts diverge: a denied export FLAGS (P1),
+        # a tainted plain READ stays CLEAN (absent from the wire map).
+        assert snap_fail.resource_reputation["rr"] == pytest.approx(1.0)
+        assert snap_fail.resource_level["rr"] == "flagged"
+        assert "rr" not in snap_read.resource_reputation
 
     def test_container_scores_populated(self, session, tmp_path) -> None:
         """Container aggregation is computed from the read-back resource scores."""
@@ -528,28 +539,33 @@ class TestFullCycleSnapshot:
             container_members=members,
         )
 
-        assert snap.resource_reputation["r_hot"] > 0.0
-        # Caution reached the neighbour and is visible in the snapshot.
-        assert snap.resource_reputation.get("r_quiet", 0.0) > 0.0
-        assert snap.resource_reputation["r_quiet"] == pytest.approx(
+        assert snap.resource_score_telemetry["r_hot"] > 0.0
+        # Caution (numeric bleed) reached the neighbour in the score TELEMETRY.
+        assert snap.resource_score_telemetry.get("r_quiet", 0.0) > 0.0
+        assert snap.resource_score_telemetry["r_quiet"] == pytest.approx(
             _score(session, "r_quiet")
         )
+        # The decidable layer: r_hot is WATCH (one tainted staging session);
+        # adjacency labels propagate only from FLAGGED members, so r_quiet
+        # stays off the wire map — a neighbour of a merely-watched resource
+        # must not tighten core.
+        assert snap.resource_reputation["r_hot"] == pytest.approx(0.4)
+        assert "r_quiet" not in snap.resource_reputation
 
     def test_fanout_boost_in_snapshot(self, session, tmp_path) -> None:
-        """A fired fanout adds FANOUT_WEIGHT on top of the hot weight in the snapshot."""
-        from axor_sentinel.sentinel.events import AgentContainerBaseline
-        from axor_sentinel.sentinel.cycle import FANOUT_MIN_SESSIONS
-
+        """A quota-exceeding fanout boosts the score telemetry and floors the
+        touched resources at WATCH with the fanout fact attached."""
         agent = "fan"
-        baseline = AgentContainerBaseline(
-            agent_id=agent, mean_containers_per_session=1.0,
-            std_containers_per_session=0.5, session_count=FANOUT_MIN_SESSIONS,
-            last_updated=0.0,
-        )
-        cycle = SentinelCycle(session, tmp_path, agent_baselines={agent: baseline})
-        # 10 unique containers → z = (10 - 1.0) / 0.5 = 18 >> 2.5 → fanout fires.
+        cycle = SentinelCycle(session, tmp_path, agent_baselines={})
+        # 10 unique containers > default quota (7) → fanout fires (no baseline
+        # needed — the deterministic quota has no cold start).
         accesses = [_access(f"r{i}", f"c{i}", SignalType.READ_SUMMARIZE) for i in range(10)]
         snap = cycle.run_once([_summary("s_fan", agent, accesses)])
 
         # READ_SUMMARIZE hot weight alone ≈ 0.6; with fanout 0.5 on top → ≈ 0.8.
-        assert snap.resource_reputation["r0"] > 0.6
+        assert snap.resource_score_telemetry["r0"] > 0.6
+        # Decidable layer: fanout floors the touched resource at WATCH and
+        # names the fact.
+        assert snap.resource_reputation["r0"] == pytest.approx(0.4)
+        assert snap.resource_level["r0"] == "watch"
+        assert any(f.startswith("F1:fanout") for f in snap.verdict_facts["r0"])
