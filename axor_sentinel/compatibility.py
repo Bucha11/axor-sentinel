@@ -19,8 +19,11 @@ log = logging.getLogger("axor.sentinel.compat")
 
 # Inclusive lower bound, exclusive upper bound — the axor-core range these
 # sentinel contracts were validated against. Bump on contract-affecting releases.
+# 0.9.x validated: the session-audit seam (SessionAuditRecord/SessionSink) and
+# the enricher boundary (NormalizedIntent reputation fields, detection_floor
+# semantics) are unchanged in core 0.9.1.
 MIN_AXOR_CORE = (0, 7, 0)
-MAX_AXOR_CORE = (0, 9, 0)
+MAX_AXOR_CORE = (0, 10, 0)
 
 
 def _parse(version: str) -> tuple[int, int, int]:
