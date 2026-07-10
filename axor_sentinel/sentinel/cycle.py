@@ -20,6 +20,7 @@ from axor_sentinel.sentinel.events import (
 )
 from axor_sentinel.sentinel.attestation import (
     AttestationRecord,
+    active_prior_heat,
     effective_score,
     validate,
 )
@@ -476,6 +477,25 @@ class SentinelCycle:
                             ReputationLevel.WATCH,
                             prior_verdict.facts + (f"A1:adjacent_to_flagged:{cid}",),
                         )
+
+        # Operator attestations in the level codomain (UI spec 8.1.1): an
+        # active (unrevoked) attestation descends the EXPORTED verdict one
+        # level. History stays — the attestation id lands in the facts, and
+        # the evidence windows and Neo4j are untouched — and every cycle
+        # re-derives levels from evidence before descending, so a
+        # re-triggering branch climbs right back: "I checked, resume
+        # watching", never "trust this forever". The scalar effective_score
+        # above already applied the same event to the telemetry map.
+        for rid, records in self._attestations.items():
+            if active_prior_heat(records) is None:
+                continue
+            attested = resource_verdicts.get(rid)
+            if attested is None or attested.level == ReputationLevel.CLEAN:
+                continue
+            resource_verdicts[rid] = Verdict(
+                ReputationLevel(attested.level - 1),
+                attested.facts + (f"A2:attested:{records[0].attestation_id}",),
+            )
         resource_levels = {rid: v.level for rid, v in resource_verdicts.items()}
 
         container_levels: dict[str, ReputationLevel] = {
