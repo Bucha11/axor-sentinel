@@ -434,10 +434,12 @@ class SentinelCycle:
             ):
                 for r in member_ids:
                     if resource_levels.get(r, ReputationLevel.CLEAN) < ReputationLevel.WATCH:
-                        prior = resource_verdicts.get(r, Verdict(ReputationLevel.CLEAN))
+                        prior_verdict = resource_verdicts.get(
+                            r, Verdict(ReputationLevel.CLEAN)
+                        )
                         resource_verdicts[r] = Verdict(
                             ReputationLevel.WATCH,
-                            prior.facts + (f"A1:adjacent_to_flagged:{cid}",),
+                            prior_verdict.facts + (f"A1:adjacent_to_flagged:{cid}",),
                         )
         resource_levels = {rid: v.level for rid, v in resource_verdicts.items()}
 
