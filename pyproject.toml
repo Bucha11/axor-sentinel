@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "axor-sentinel"
-version = "0.3.0"
+version = "0.3.1"
 description = "Cross-session behavioral analysis for Axor via weighted resource reputation graph"
 readme = "README.md"
 license = { text = "Apache-2.0" }
