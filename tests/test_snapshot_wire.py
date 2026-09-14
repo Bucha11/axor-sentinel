@@ -61,6 +61,39 @@ def test_a_rewritten_map_is_refused() -> None:
         snapshot_from_payload(payload)
 
 
+def test_a_json_round_trip_does_not_break_the_checksum() -> None:
+    """The checksum covers a serialisation in which 1.0 is written "1.0", and a
+    JSON round-trip does not preserve that: JSON.parse("1.0") is the number 1,
+    JSON.stringify writes "1", and Python then parses an int. The maps are
+    numerically identical and the naive comparison fails.
+
+    Verifying against the sender's spelling would make this wire
+    Python-to-Python only, and would reject a correct snapshot for the crime of
+    passing through a proxy that reformatted its JSON.
+    """
+    snapshot = _snapshot()
+    payload = snapshot_payload(snapshot)
+    # exactly what a JS (or any int-collapsing) JSON writer emits
+    payload["resource_reputation"] = {
+        k: int(v) if float(v).is_integer() else v
+        for k, v in payload["resource_reputation"].items()
+    }
+    assert payload["resource_reputation"]["db:customers"] == 1  # an int, not 1.0
+
+    arrived = snapshot_from_payload(payload)
+    assert arrived == snapshot
+    assert arrived.resource_reputation["db:customers"] == 1.0
+
+
+def test_the_round_trip_tolerance_does_not_soften_the_tamper_check() -> None:
+    """The reason to be careful: the coercion normalises SPELLING, never value.
+    A cleared FLAGGED resource is still a different number and still refused."""
+    payload = snapshot_payload(_snapshot())
+    payload["resource_reputation"]["db:customers"] = 0  # cleared, int-spelled
+    with pytest.raises(SnapshotRejected, match="checksum"):
+        snapshot_from_payload(payload)
+
+
 def test_a_calibrated_float_is_not_a_verdict() -> None:
     """The codomain is finite by construction so core's detection_floor
     comparison is decidable. A consumer that did not compute these numbers has

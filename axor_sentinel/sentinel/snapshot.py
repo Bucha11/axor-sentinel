@@ -187,10 +187,26 @@ def snapshot_from_payload(payload: object) -> ReputationSnapshot:
     if not isinstance(payload, dict):
         raise SnapshotRejected("snapshot must be an object")
     known = {f.name for f in fields(ReputationSnapshot)}
+    fetched = {k: v for k, v in payload.items() if k in known}
+    # Coerce the suspicion maps to float BEFORE anything reads them, the
+    # checksum included. The checksum covers a canonical serialisation in which
+    # 1.0 is written "1.0" — and a JSON round-trip does not preserve that.
+    # JSON.parse("1.0") is the number 1, JSON.stringify writes "1", and Python
+    # then parses an int; the maps are numerically identical and the checksum
+    # does not match. Verifying against the sender's spelling would have made
+    # this wire Python-to-Python only, and would have rejected a correct
+    # snapshot for passing through a proxy that reformatted its JSON.
+    for name in ("resource_reputation", "container_reputation",
+                 "resource_score_telemetry", "container_score_telemetry"):
+        got = fetched.get(name)
+        if isinstance(got, dict):
+            fetched[name] = {
+                k: float(v) if isinstance(v, (int, float))
+                and not isinstance(v, bool) else v
+                for k, v in got.items()
+            }
     try:
-        snapshot = ReputationSnapshot(
-            **{k: v for k, v in payload.items() if k in known}
-        )
+        snapshot = ReputationSnapshot(**fetched)
     except TypeError as exc:  # missing version / generated_at, wrong types
         raise SnapshotRejected(f"not a snapshot: {exc}") from exc
 
