@@ -22,8 +22,16 @@ log = logging.getLogger("axor.sentinel.compat")
 # 0.9.x validated: the session-audit seam (SessionAuditRecord/SessionSink) and
 # the enricher boundary (NormalizedIntent reputation fields, detection_floor
 # semantics) are unchanged in core 0.9.1.
+# 0.10.x validated: that release only removes ``axor_core.plane`` (the
+# control-plane client moved to axor-wrap), which this package never imported.
+# 0.11.x validated: it moves the cross-boundary schemas into the kernel and adds
+# `policy.from_record` and the shared vectors — none of which this package
+# imports. The two surfaces it does touch, `contracts.anomaly.NormalizedIntent`
+# and `contracts.intent.Intent`, are unchanged. Measured against an installed
+# 0.11.0: 199 tests pass and the only failure was this bound refusing the
+# version it was running on.
 MIN_AXOR_CORE = (0, 7, 0)
-MAX_AXOR_CORE = (0, 10, 0)
+MAX_AXOR_CORE = (0, 12, 0)
 
 
 def _parse(version: str) -> tuple[int, int, int]:
