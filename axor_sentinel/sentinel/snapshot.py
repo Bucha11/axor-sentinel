@@ -74,9 +74,7 @@ def verify_blob(serialized: str, signature: str | None) -> bool:
             return False
         expected = hmac.new(key, serialized.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(signature, expected)
-    if _signature_required():
-        return False
-    return True
+    return not _signature_required()
 
 
 class AuditIntegrityWarning(UserWarning):
@@ -136,7 +134,7 @@ class ReputationSnapshot:
         """HMAC-SHA256 of the reputation maps under the given key."""
         return hmac.new(key, self._canonical_payload(), hashlib.sha256).hexdigest()
 
-    def with_checksum(self) -> "ReputationSnapshot":
+    def with_checksum(self) -> ReputationSnapshot:
         """Return a copy with checksum populated, and signature if a key is set."""
         updated = replace(self, checksum=self.compute_checksum())
         key = _snapshot_key()

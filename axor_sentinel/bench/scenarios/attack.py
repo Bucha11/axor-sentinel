@@ -6,8 +6,8 @@ import uuid
 from dataclasses import dataclass
 
 from axor_sentinel.bench.dataset.schema import (
-    GroundTruth,
     AccessEvent,
+    GroundTruth,
     ResourceNode,
     Scenario,
     SessionRecord,
@@ -88,13 +88,19 @@ def slow_and_low(
 
     # Tainted sessions spread over gap_days
     for i in range(config.staging_sessions):
-        session_time = now - (config.gap_days * 86400 * (config.staging_sessions - i) / config.staging_sessions)
+        session_time = now - (
+            config.gap_days * 86400
+            * (config.staging_sessions - i) / config.staging_sessions
+        )
         signal = (
             SignalType.READ_SUMMARIZE
             if i < config.staging_sessions - 1
             else SignalType.READ_EXPORT_ADJACENT
         )
-        resources_this = staging_resources if config.resource_reuse else [staging_resources[i % len(staging_resources)]]
+        resources_this = (
+            staging_resources if config.resource_reuse
+            else [staging_resources[i % len(staging_resources)]]
+        )
         accesses = [
             AccessEvent(
                 resource_id=r.resource_id,
@@ -120,7 +126,10 @@ def slow_and_low(
         # Intersperse noise sessions
         for _ in range(config.noise_sessions):
             noise_id = _make_session_id()
-            noise_container = topology.containers[1] if len(topology.containers) > 1 else staging_container
+            noise_container = (
+                topology.containers[1] if len(topology.containers) > 1
+                else staging_container
+            )
             sessions.append(SessionRecord(
                 session_id=noise_id,
                 agent_id=agent_id,

@@ -139,7 +139,7 @@ class TopologyGenerator:
         for r in resources:
             container_map.setdefault(r.container_id, []).append(r.resource_id)
 
-        for cid, rids in container_map.items():
+        for _cid, rids in container_map.items():
             for i, rid_a in enumerate(rids):
                 for rid_b in rids[i + 1:]:
                     # Bidirectional

@@ -75,7 +75,7 @@ class SnapshotIntentEnricher:
         self._snapshot = snapshot
 
     @classmethod
-    def from_dir(cls, snapshot_dir: Path) -> "SnapshotIntentEnricher":
+    def from_dir(cls, snapshot_dir: Path) -> SnapshotIntentEnricher:
         """Load snapshot from directory and return an enricher instance."""
         snapshot = load_snapshot(Path(snapshot_dir))
         return cls(snapshot)
@@ -86,9 +86,9 @@ class SnapshotIntentEnricher:
 
     def enrich(
         self,
-        normalized: "NormalizedIntent",
-        intent: "Intent",
-    ) -> "NormalizedIntent":
+        normalized: NormalizedIntent,
+        intent: Intent,
+    ) -> NormalizedIntent:
         """
         Return normalized with reputation fields populated from snapshot.
 
@@ -121,7 +121,7 @@ class SnapshotIntentEnricher:
             log.debug("enricher failed (returning original): %s", exc)
             return normalized
 
-    def _derive_ids(self, intent: "Intent") -> tuple[str, str]:
+    def _derive_ids(self, intent: Intent) -> tuple[str, str]:
         """
         Derive (resource_id, container_id) from intent args.
 

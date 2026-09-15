@@ -45,7 +45,7 @@ class ReputationEvent:
         score_after: float,
         reason: str,
         timestamp: float,
-    ) -> "ReputationEvent":
+    ) -> ReputationEvent:
         return cls(
             event_id=uuid.uuid4().hex,
             resource_id=resource_id,

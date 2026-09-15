@@ -24,9 +24,10 @@ def test_parse_handles_suffixes():
 
 
 def test_skew_warns_then_raises(monkeypatch):
-    import axor_sentinel.compatibility as compat
     # Force the installed version below the minimum by stubbing axor_core.
     import axor_core
+
+    import axor_sentinel.compatibility as compat
     monkeypatch.setattr(axor_core, "__version__", "0.1.0", raising=False)
 
     with pytest.warns(RuntimeWarning):

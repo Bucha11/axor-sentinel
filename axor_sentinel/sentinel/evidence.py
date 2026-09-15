@@ -18,8 +18,8 @@ apples-to-apples.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from axor_sentinel.graph.model import SignalType
 
@@ -65,7 +65,7 @@ class Evidence:
         }
 
     @classmethod
-    def from_json(cls, obj: dict) -> "Evidence":
+    def from_json(cls, obj: dict) -> Evidence:
         return cls(
             origin=str(obj["origin"]),
             session_id=str(obj["session_id"]),
@@ -122,7 +122,7 @@ class EvidenceStore:
         }
 
     @classmethod
-    def from_json(cls, obj: dict) -> "EvidenceStore":
+    def from_json(cls, obj: dict) -> EvidenceStore:
         store = cls()
         try:
             for rid, items in obj.items():

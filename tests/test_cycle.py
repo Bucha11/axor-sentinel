@@ -14,15 +14,12 @@ import pytest
 
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.cycle import (
-
     FANOUT_WEIGHT,
     ResourceAccess,
     SentinelCycle,
     SessionSummary,
 )
 from axor_sentinel.sentinel.events import AgentContainerBaseline
-
-
 
 # ── Mock Neo4j session ────────────────────────────────────────────────────────
 
@@ -152,8 +149,16 @@ class TestRunOnceHotWeights:
         cycle.run_once([sess])
 
         query_names = [q for q, _ in neo4j.calls]
-        decay_idx = next((i for i, q in enumerate(query_names) if "last_decay_at" in q and "suspicion_score" in q and "0.5" in q), None)
-        hot_idx = next((i for i, q in enumerate(query_names) if "last_signal_at" in q and "had_taint" in q), None)
+        decay_idx = next(
+            (i for i, q in enumerate(query_names)
+             if "last_decay_at" in q and "suspicion_score" in q and "0.5" in q),
+            None,
+        )
+        hot_idx = next(
+            (i for i, q in enumerate(query_names)
+             if "last_signal_at" in q and "had_taint" in q),
+            None,
+        )
         assert decay_idx is not None, "DECAY_QUERY not found in Neo4j calls"
         assert hot_idx is not None, "HOT_WEIGHT_QUERY not found in Neo4j calls"
         assert decay_idx < hot_idx, "Decay must run before hot weights (invariant A-4)"
@@ -318,8 +323,9 @@ class TestStatePersistence:
     def test_init_loads_persisted_state(self, tmp_path: Path) -> None:
         """A new SentinelCycle (no explicit baselines) must load state from disk."""
         # Write state manually
-        from axor_sentinel.sentinel.cycle import SentinelCycle as SC
         import json
+
+        from axor_sentinel.sentinel.cycle import SentinelCycle as SC
 
         state = {
             "version": 5,

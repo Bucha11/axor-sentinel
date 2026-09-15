@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Mapping, Protocol, Sequence, runtime_checkable
+from collections.abc import Mapping, Sequence
+from typing import Protocol, runtime_checkable
 
 from axor_sentinel.graph.derive import derive_container_id, derive_resource_info
 from axor_sentinel.graph.model import SignalType
@@ -95,7 +96,7 @@ class CoreSessionSink:
     def __init__(self) -> None:
         self._pending: list[SessionSummary] = []
 
-    async def on_session_closed(self, record: "CoreSessionRecord") -> None:
+    async def on_session_closed(self, record: CoreSessionRecord) -> None:
         """
         Buffer a sentinel ``SessionSummary`` derived from a core audit record.
 
@@ -113,7 +114,7 @@ class CoreSessionSink:
             summary = self._minimal_summary(record)
         self._pending.append(summary)
 
-    def _map_record(self, record: "CoreSessionRecord") -> SessionSummary:
+    def _map_record(self, record: CoreSessionRecord) -> SessionSummary:
         """Translate a raw core ``SessionAuditRecord`` into a ``SessionSummary``."""
         event_kinds = tuple(record.event_kinds)
         taint_sources = tuple(record.taint_sources)
@@ -191,7 +192,7 @@ class CoreSessionSink:
         )
 
     @staticmethod
-    def _minimal_summary(record: "CoreSessionRecord") -> SessionSummary:
+    def _minimal_summary(record: CoreSessionRecord) -> SessionSummary:
         """
         Build a degraded-but-non-empty summary when full mapping fails.
 

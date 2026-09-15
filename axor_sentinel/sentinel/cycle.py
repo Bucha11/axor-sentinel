@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -10,32 +11,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from axor_sentinel.graph.model import SignalType
 from axor_sentinel.graph import construct
 from axor_sentinel.graph import queries as q
-from axor_sentinel.sentinel.events import (
-    AgentContainerBaseline,
-    FanoutSignal,
-    ReputationEvent,
-)
+from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.attestation import (
     AttestationRecord,
     active_prior_heat,
     effective_score,
     validate,
 )
-from axor_sentinel.sentinel.snapshot import (
-    ReputationSnapshot,
-    atomic_swap,
-    sign_blob,
-    validate_snapshot_dir,
-    verify_blob,
-)
-from axor_sentinel.sentinel.weight import (
-    FLAG_THRESHOLD,
-    compute_weight_factors,
-    compute_hot_weight,
-    compute_container_score,
+from axor_sentinel.sentinel.events import (
+    AgentContainerBaseline,
+    FanoutSignal,
+    ReputationEvent,
 )
 from axor_sentinel.sentinel.evidence import EvidenceStore, evidence_from_session
 from axor_sentinel.sentinel.predicates import (
@@ -46,6 +34,19 @@ from axor_sentinel.sentinel.predicates import (
     evaluate_container,
     evaluate_resource,
     fanout_exceeded,
+)
+from axor_sentinel.sentinel.snapshot import (
+    ReputationSnapshot,
+    atomic_swap,
+    sign_blob,
+    validate_snapshot_dir,
+    verify_blob,
+)
+from axor_sentinel.sentinel.weight import (
+    FLAG_THRESHOLD,
+    compute_container_score,
+    compute_hot_weight,
+    compute_weight_factors,
 )
 
 log = logging.getLogger("axor.sentinel.cycle")
@@ -709,10 +710,9 @@ class SentinelCycle:
 
         baselines: dict[str, AgentContainerBaseline] = {}
         for aid, bdata in raw.get("baselines", {}).items():
-            try:
+            # schema mismatch after upgrade — skip the stale entry
+            with contextlib.suppress(TypeError):
                 baselines[aid] = AgentContainerBaseline(**bdata)
-            except TypeError:
-                pass  # schema mismatch after upgrade — skip stale entry
 
         version = int(raw.get("version", 0))
         evidence = EvidenceStore.from_json(raw.get("evidence", {}))

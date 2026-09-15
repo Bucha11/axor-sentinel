@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 
-class SignalType(str, Enum):
+class SignalType(StrEnum):
     """Hot-signal involvement depth for a resource in a tainted session."""
     READ = "read"                              # 0.4 — read-only access
     READ_SUMMARIZE = "read_summarize"          # 0.6 — read + summarized

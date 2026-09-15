@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "axor-sentinel"
-version = "0.4.0"
+version = "0.4.1"
 description = "Cross-session behavioral analysis for Axor via weighted resource reputation graph"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -29,7 +29,16 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
-    "ruff>=0.4",
+    # Bounded on purpose, and the rules stated below. This repo declared no
+    # [tool.ruff] section and no upper bound, so CI linted against whatever
+    # ruff's DEFAULT rule set happened to be — and the wider default in 0.16
+    # reddened the v0.4.0 release run with C408/RUF059/I001 findings in files
+    # nobody had touched. A local ruff 0.15 passed the same tree. axor-eval hit
+    # this exact failure and fixed it the same way; this repo did not get the
+    # fix. An explicit `select` stops the category drift; the ceiling covers a
+    # new rule landing inside a category already selected, so a linter release
+    # cannot fail a build on its own.
+    "ruff>=0.5,<0.17",
     "mypy>=1.10",
 ]
 
@@ -38,6 +47,23 @@ Repository = "https://github.com/Bucha11/axor-sentinel"
 
 [tool.hatch.build.targets.wheel]
 packages = ["axor_sentinel"]
+
+[tool.ruff]
+# py311 is the floor in requires-python; targeting 3.12 here would let the
+# pyupgrade rules rewrite code into syntax a supported interpreter cannot parse.
+target-version = "py311"
+# the width this codebase is written at, matching axor-eval and the control plane.
+line-length = 100
+
+[tool.ruff.lint]
+# correctness and modernization, stated rather than inherited — the same set
+# axor-eval settled on after the same failure.
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+# a test may build a throwaway in a loop or bind a name it never reads; neither
+# is a defect in a test the way it is in library code.
+"tests/*" = ["B008", "F841"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

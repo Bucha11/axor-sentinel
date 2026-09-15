@@ -24,7 +24,6 @@ from axor_sentinel.sentinel.snapshot import (
     load_snapshot,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _make_snap(version: int, scores: dict[str, float] | None = None) -> ReputationSnapshot:

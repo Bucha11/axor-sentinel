@@ -34,7 +34,7 @@ class EvaluationResult:
 
 
 def evaluate(
-    scenarios: list["Scenario"],
+    scenarios: list[Scenario],
     scores: dict[str, float],
     fpr_budget: float = FPR_BUDGET,
 ) -> EvaluationResult:
@@ -95,11 +95,10 @@ def evaluate(
         tp = sum(1 for sc, is_atk, _ in labeled if sc >= thresh and is_atk)
         fpr = fp / n_benign
         tpr = tp / n_attack
-        if fpr <= fpr_budget:
-            if tpr > best_tpr or (tpr == best_tpr and fpr < best_fpr):
-                best_tpr = tpr
-                best_fpr = fpr
-                best_threshold = thresh
+        if fpr <= fpr_budget and (tpr > best_tpr or (tpr == best_tpr and fpr < best_fpr)):
+            best_tpr = tpr
+            best_fpr = fpr
+            best_threshold = thresh
 
     # Counts at chosen threshold
     tp = sum(1 for sc, is_atk, _ in labeled if sc >= best_threshold and is_atk)
