@@ -10,7 +10,15 @@ import warnings
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
+from axor_sentinel.sentinel.predicates import LEVEL_SUSPICION, ReputationLevel
+
 log = logging.getLogger("axor.sentinel.snapshot")
+
+# The two vocabularies a snapshot is written in, read from the module that
+# DEFINES them rather than spelled again: the finite suspicion codomain and
+# the level names beside it.
+_SUSPICION_VALUES: frozenset[float] = frozenset(LEVEL_SUSPICION.values())
+_LEVEL_NAMES: frozenset[str] = frozenset(level.name for level in ReputationLevel)
 
 # Number of old snapshot version files to keep alongside the current symlink.
 SNAPSHOT_RETAIN_VERSIONS: int = 3
@@ -135,6 +143,110 @@ class ReputationSnapshot:
         if key is not None:
             updated = replace(updated, signature=updated.compute_signature(key))
         return updated
+
+
+class SnapshotRejected(ValueError):
+    """A payload that is not a usable ReputationSnapshot."""
+
+
+# The snapshot over a wire, not a filesystem.
+#
+# `atomic_swap` / `load_snapshot` deliver a snapshot to a reader on the SAME
+# host — the enricher on the governance hot path, reading a symlink the cycle
+# swapped. A control plane is not on that host: it renders the reputation a
+# node's sentinel computed, so the snapshot has to travel, and the shape it
+# travels in belongs here beside the dataclass rather than in whatever consumer
+# happens to need it first.
+#
+# The checksum comes along and is CHECKED on arrival. On disk it guards against
+# corruption between two processes that trust each other; over a wire the maps
+# and their checksum arrive from somewhere else entirely, and a payload whose
+# checksum does not match the maps it carries is not a snapshot that lost a bit
+# — it is a snapshot somebody rewrote. The HMAC signature is a separate,
+# stronger claim and stays optional: it is keyed to the node's own
+# AXOR_SNAPSHOT_KEY, which a plane does not hold and must not.
+
+
+def snapshot_payload(snapshot: ReputationSnapshot) -> dict:
+    """The snapshot as JSON-ready data, checksum included."""
+    return asdict(snapshot)
+
+
+def snapshot_from_payload(payload: object) -> ReputationSnapshot:
+    """Rebuild a ReputationSnapshot that arrived over a wire.
+
+    Forward-compatible in the same direction `_deserialize` is: a field added by
+    a newer sentinel is dropped rather than raising, because integrity is
+    enforced over the reputation maps and a stray key cannot alter them.
+
+    Raises SnapshotRejected on anything that is not a snapshot: a bad shape, a
+    reputation value outside the finite codomain a deterministic sentinel emits,
+    a level name this library does not know, or a checksum that does not match
+    the maps in the payload.
+    """
+    if not isinstance(payload, dict):
+        raise SnapshotRejected("snapshot must be an object")
+    known = {f.name for f in fields(ReputationSnapshot)}
+    fetched = {k: v for k, v in payload.items() if k in known}
+    # Coerce the suspicion maps to float BEFORE anything reads them, the
+    # checksum included. The checksum covers a canonical serialisation in which
+    # 1.0 is written "1.0" — and a JSON round-trip does not preserve that.
+    # JSON.parse("1.0") is the number 1, JSON.stringify writes "1", and Python
+    # then parses an int; the maps are numerically identical and the checksum
+    # does not match. Verifying against the sender's spelling would have made
+    # this wire Python-to-Python only, and would have rejected a correct
+    # snapshot for passing through a proxy that reformatted its JSON.
+    for name in ("resource_reputation", "container_reputation",
+                 "resource_score_telemetry", "container_score_telemetry"):
+        got = fetched.get(name)
+        if isinstance(got, dict):
+            fetched[name] = {
+                k: float(v) if isinstance(v, (int, float))
+                and not isinstance(v, bool) else v
+                for k, v in got.items()
+            }
+    try:
+        snapshot = ReputationSnapshot(**fetched)
+    except TypeError as exc:  # missing version / generated_at, wrong types
+        raise SnapshotRejected(f"not a snapshot: {exc}") from exc
+
+    for name in ("resource_reputation", "container_reputation"):
+        got = getattr(snapshot, name)
+        if not isinstance(got, dict):
+            raise SnapshotRejected(f"`{name}` must be an object")
+        for key, value in got.items():
+            if not isinstance(key, str) or isinstance(value, bool) or not isinstance(
+                value, (int, float)
+            ):
+                raise SnapshotRejected(f"`{name}` maps ids to suspicion values")
+            # The codomain is finite by construction (predicates.LEVEL_SUSPICION).
+            # Checking it here is what keeps core's detection_floor comparison
+            # decidable for a consumer that did not compute these numbers: an
+            # arbitrary float would reintroduce exactly the calibrated threshold
+            # the deterministic verdict layer exists to remove.
+            if float(value) not in _SUSPICION_VALUES:
+                raise SnapshotRejected(
+                    f"`{name}[{key}]` = {value} is not one of "
+                    f"{sorted(_SUSPICION_VALUES)} — a deterministic sentinel "
+                    f"emits a finite codomain"
+                )
+
+    for name in ("resource_level", "container_level"):
+        got = getattr(snapshot, name)
+        if not isinstance(got, dict) or not all(
+            isinstance(k, str) and v in _LEVEL_NAMES for k, v in got.items()
+        ):
+            raise SnapshotRejected(
+                f"`{name}` maps ids to a level in {sorted(_LEVEL_NAMES)}"
+            )
+
+    if not isinstance(snapshot.version, int) or isinstance(snapshot.version, bool):
+        raise SnapshotRejected("`version` must be an integer")
+    if snapshot.checksum != snapshot.compute_checksum():
+        raise SnapshotRejected(
+            "checksum does not match the reputation maps in this payload"
+        )
+    return snapshot
 
 
 def _serialize(snapshot: ReputationSnapshot) -> str:
