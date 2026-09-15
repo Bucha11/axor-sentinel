@@ -5,8 +5,8 @@ import time
 import uuid
 
 from axor_sentinel.bench.dataset.schema import (
-    GroundTruth,
     AccessEvent,
+    GroundTruth,
     ResourceNode,
     Scenario,
     SessionRecord,

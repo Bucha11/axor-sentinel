@@ -8,13 +8,12 @@ Protocol compatibility is exercised without importing axor-core.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping
 
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.integration.core_sink import CoreSessionSink
 from axor_sentinel.sentinel.cycle import ResourceAccess, SessionSummary
-
 
 # ── Local stand-ins for the core observation contract ──────────────────────────
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 from urllib.parse import urlparse
-
 
 # Confidence tiers
 _CONFIDENCE_PROVIDER_ID = 1.0
@@ -107,10 +107,8 @@ def _normalize_path(raw: str) -> str:
     # absolute paths are realpath-resolved — relative paths must not be joined
     # against the current working directory (that would be non-deterministic).
     if os.path.isabs(resolved):
-        try:
+        with contextlib.suppress(OSError):
             resolved = os.path.realpath(resolved).replace("\\", "/")
-        except OSError:
-            pass
 
     # Lowercase and strip trailing slash (except root)
     resolved = resolved.lower()

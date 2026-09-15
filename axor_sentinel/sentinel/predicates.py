@@ -34,9 +34,9 @@ anywhere on the path.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Iterable, Sequence
 
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.evidence import Evidence

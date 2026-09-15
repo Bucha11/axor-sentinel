@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Mapping
+from collections.abc import Mapping
 
 
-def derive_resource_info(tool: str, args: "Mapping[str, object]") -> dict:
+def derive_resource_info(tool: str, args: Mapping[str, object]) -> dict:
     """Extract a normalizer-ready ``resource_info`` dict from a tool name + args."""
     args = args or {}
     resource_info: dict = {}
@@ -55,7 +55,7 @@ def derive_resource_info(tool: str, args: "Mapping[str, object]") -> dict:
     return resource_info
 
 
-def _infer_service(tool: str, args: "Mapping[str, object]") -> str:
+def _infer_service(tool: str, args: Mapping[str, object]) -> str:
     """Infer the service/datasource name from tool name or args."""
     t = tool.lower()
     if "sharepoint" in t or "sp_" in t:

@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import pytest
 
-import time
-
-from axor_sentinel.graph import construct, queries as q
+from axor_sentinel.graph import construct
+from axor_sentinel.graph import queries as q
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.cycle import ResourceAccess, SentinelCycle, SessionSummary
 from axor_sentinel.sentinel.weight import accumulate
@@ -233,9 +233,11 @@ class TestHotWeightQuery:
             """
             CREATE (s:Session {session_id: 's_multi', had_taint: true})
             CREATE (a:Resource {id: 'r_a', suspicion_score: 0.0, canonical_confidence: 1.0,
-                                flagged: false, last_decay_at: timestamp(), last_signal_at: timestamp()})
+                                flagged: false, last_decay_at: timestamp(),
+                                last_signal_at: timestamp()})
             CREATE (b:Resource {id: 'r_b', suspicion_score: 0.0, canonical_confidence: 1.0,
-                                flagged: false, last_decay_at: timestamp(), last_signal_at: timestamp()})
+                                flagged: false, last_decay_at: timestamp(),
+                                last_signal_at: timestamp()})
             CREATE (s)-[:ACCESSED {signal_type: 'READ'}]->(a)
             CREATE (s)-[:ACCESSED {signal_type: 'READ'}]->(b)
             """

@@ -9,7 +9,6 @@ from axor_sentinel.bench.scenarios import attack as atk
 from axor_sentinel.bench.scenarios import benign as ben
 from axor_sentinel.bench.topology.pool import TopologyPool
 
-
 # Default paper-baseline composition counts.
 # NOTE: bench/configs/paper_baseline.yaml is the human-readable source of truth
 # for these numbers.  Changes here must be mirrored in that file (and vice versa).

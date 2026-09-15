@@ -23,19 +23,22 @@ import pytest
 # Need axor-core on the path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "axor-core"))
 
+from axor_core.capability.executor import CapabilityExecutor, ToolHandler
 from axor_core.contracts.anomaly import NormalizedIntent
 from axor_core.contracts.cancel import make_token
 from axor_core.contracts.context import (
-    ContextFragment, ContextView, LineageSummary,
+    ContextFragment,
+    ContextView,
+    LineageSummary,
 )
 from axor_core.contracts.degradation import DegradationLevel
 from axor_core.contracts.envelope import Capabilities, ExecutionEnvelope, ExportContract
 from axor_core.contracts.intent import Intent, IntentKind
 from axor_core.contracts.result import ExecutorEvent, ExecutorEventKind
-from axor_core.capability.executor import CapabilityExecutor, ToolHandler
 from axor_core.degradation.engine import DegradationEngine
 from axor_core.node.intent_loop import IntentLoop
 from axor_core.policy.presets import standard as standard_policy
+
 from axor_sentinel.graph.derive import derive_resource_info
 from axor_sentinel.graph.normalizer import normalize_resource_id
 from axor_sentinel.integration.intent_enricher import (
@@ -84,7 +87,9 @@ def _make_envelope(allowed_tools: frozenset[str] = frozenset({"read"})) -> Execu
     )
 
 
-def _make_normalized(after_external_read: bool = False, resource_rep: float = 0.0) -> NormalizedIntent:
+def _make_normalized(
+    after_external_read: bool = False, resource_rep: float = 0.0,
+) -> NormalizedIntent:
     return NormalizedIntent(
         tool="read", operation="file_read", target_kind="workdir",
         destination_kind="none", provenance="repo",
@@ -153,7 +158,9 @@ class TestPolarityConversion:
         ).with_checksum()
         atomic_swap(tmp_path, snap)
         enricher = SnapshotIntentEnricher.from_dir(tmp_path)
-        result = enricher.enrich(_make_normalized(after_external_read=True), _make_intent("/data/r.txt"))
+        result = enricher.enrich(
+            _make_normalized(after_external_read=True), _make_intent("/data/r.txt"),
+        )
         assert result.target_resource_reputation == pytest.approx(0.1)  # 1 - 0.9
 
 
@@ -212,6 +219,8 @@ class TestFlaggedNotAFeature:
         ).with_checksum()
         atomic_swap(tmp_path, snap)
         enricher = SnapshotIntentEnricher.from_dir(tmp_path)
-        result = enricher.enrich(_make_normalized(after_external_read=True), _make_intent("/data/r.txt"))
+        result = enricher.enrich(
+            _make_normalized(after_external_read=True), _make_intent("/data/r.txt"),
+        )
         field_names = {f.name for f in dataclasses.fields(result)}
         assert "flagged" not in field_names

@@ -17,12 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from axor_sentinel.bench.dataset.composer import DatasetComposer
 from axor_sentinel.bench.dataset.schema import Scenario
-from axor_sentinel.bench.eval.metrics import evaluate, FPR_BUDGET
-from axor_sentinel.graph.model import SignalType, HOT_WEIGHTS
-from axor_sentinel.sentinel.weight import (
-    accumulate,
-    apply_decay_to_score,
-)
+from axor_sentinel.bench.eval.metrics import FPR_BUDGET, evaluate
+from axor_sentinel.graph.model import HOT_WEIGHTS, SignalType
 from axor_sentinel.sentinel.evidence import Evidence, resolution_from_confidence
 from axor_sentinel.sentinel.predicates import (
     ReputationLevel,
@@ -30,7 +26,10 @@ from axor_sentinel.sentinel.predicates import (
     evaluate_resource,
     fanout_exceeded,
 )
-
+from axor_sentinel.sentinel.weight import (
+    accumulate,
+    apply_decay_to_score,
+)
 
 # ── Deterministic predicate scorer (unfitted — declared policy constants) ──────
 
@@ -234,7 +233,9 @@ if __name__ == "__main__":
     md_lines = []
     md_lines.append("# axor-sentinel bench results")
     md_lines.append("")
-    md_lines.append("Dataset: **820 scenarios** (420 attack, 400 benign) — paper baseline, seed=42  ")
+    md_lines.append(
+        "Dataset: **820 scenarios** (420 attack, 400 benign) — paper baseline, seed=42  "
+    )
     md_lines.append("Scorer: in-memory weight replay (no Neo4j)  ")
     md_lines.append(f"Date: {time.strftime('%Y-%m-%d')}")
     md_lines.append("")
@@ -286,10 +287,12 @@ if __name__ == "__main__":
     a = attack_scores
     b = benign_scores
     md_lines.append(
-        f"| Attack  ({len(a)}) | {a[0]:.3f} | {pct(a,0.25):.3f} | {pct(a,0.5):.3f} | {pct(a,0.75):.3f} | {pct(a,0.9):.3f} | {a[-1]:.3f} |"
+        f"| Attack  ({len(a)}) | {a[0]:.3f} | {pct(a,0.25):.3f} | {pct(a,0.5):.3f} "
+        f"| {pct(a,0.75):.3f} | {pct(a,0.9):.3f} | {a[-1]:.3f} |"
     )
     md_lines.append(
-        f"| Benign  ({len(b)}) | {b[0]:.3f} | {pct(b,0.25):.3f} | {pct(b,0.5):.3f} | {pct(b,0.75):.3f} | {pct(b,0.9):.3f} | {b[-1]:.3f} |"
+        f"| Benign  ({len(b)}) | {b[0]:.3f} | {pct(b,0.25):.3f} | {pct(b,0.5):.3f} "
+        f"| {pct(b,0.75):.3f} | {pct(b,0.9):.3f} | {b[-1]:.3f} |"
     )
     md_lines.append("")
 
@@ -303,7 +306,9 @@ if __name__ == "__main__":
     md_lines.append("- **Time decay** applied between sessions within each scenario")
     md_lines.append("  using actual timestamps from the scenario generator.")
     md_lines.append("- **`canonical_confidence`** applied per resource from scenario metadata.")
-    md_lines.append("- **Fanout detection** not included in this scorer (requires baseline history).")
+    md_lines.append(
+        "- **Fanout detection** not included in this scorer (requires baseline history)."
+    )
     md_lines.append("  Fanout scenarios are scored via hot weights only; real deployment would")
     md_lines.append("  additionally trigger the z-score path.")
     md_lines.append("- **`benign_false_taint`**: these scenarios have `had_taint=True` but no")

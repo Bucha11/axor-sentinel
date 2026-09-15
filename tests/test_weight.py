@@ -13,6 +13,7 @@ Covers invariants A-1..A-4, A-8, A-13 and spec adversarial test matrix:
 from __future__ import annotations
 
 import pytest
+
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.weight import (
     FLAG_THRESHOLD,
@@ -216,7 +217,8 @@ class TestNormalizationConfidenceScaling:
         assert abs(eff_heuristic - eff_provider * 0.4) < 1e-9
 
     def test_path_confidence_between_provider_and_heuristic(self):
-        """Path-normalized (0.7) contributes more than heuristic (0.4) and less than provider (1.0)."""
+        """Path-normalized (0.7) contributes more than heuristic (0.4)
+        and less than provider (1.0)."""
         raw = 1.0
         history: list[str] = []
 

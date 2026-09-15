@@ -15,7 +15,6 @@ from axor_sentinel.sentinel.snapshot import (
     load_snapshot,
 )
 
-
 # ── M-1: symlink aliasing collapses to one canonical id ──────────────────────
 
 def test_symlink_and_target_share_canonical_id(tmp_path):
