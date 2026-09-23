@@ -64,9 +64,16 @@ class ReputationEvent:
 @dataclass
 class FanoutSignal:
     """
-    Emitted when a tainted session touches containers at > 2.5σ above agent baseline.
+    Emitted when a tainted session exceeds the declared fanout quota: more than
+    ``SentinelPolicy.fanout_quota_for(source_class)`` DISTINCT containers
+    touched at rank ≥ READ_SUMMARIZE (predicates.fanout_exceeded /
+    fanout_containers). No baseline gates it.
 
-    Contributes a flat 0.5 weight to all touched resources (invariant A-10).
+    Contributes a flat 0.5 weight to all touched resources (invariant A-10);
+    ``affected_resources`` lists each touched resource once (never ``""``).
+    ``unique_containers`` is the qualifying count the quota compared.
+    ``z_score`` / ``baseline_mean`` are TELEMETRY against the smoothed per-agent
+    baseline (0.0 when none exists) — they never decide whether it fires.
     """
     origin_session_id: str
     agent_id: str
@@ -81,10 +88,14 @@ class FanoutSignal:
 @dataclass
 class AgentContainerBaseline:
     """
-    Per-agent baseline for fanout detection.
+    Per-agent container baseline — fanout TELEMETRY only.
 
-    Computed from the last BASELINE_WINDOW_SESSIONS (default: 50) completed sessions.
-    Cold-start guard: detection disabled when session_count < FANOUT_MIN_SESSIONS (10).
+    Computed from the last BASELINE_WINDOW_SESSIONS (default: 50) completed
+    sessions (distinct containers touched per session, any rank), exponentially
+    smoothed. It feeds FanoutSignal.z_score on an emitted signal
+    and nothing else: the trigger is the declared quota, so there is no
+    warm-up / cold-start guard (a quota needs no history) and no baseline an
+    attacker can walk upward. ``session_count`` is informational.
     """
     agent_id: str
     mean_containers_per_session: float

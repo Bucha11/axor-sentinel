@@ -186,6 +186,22 @@ def evaluate_container(
     return Verdict(ReputationLevel.CLEAN)
 
 
+def fanout_containers(accesses: Iterable[tuple[str, SignalType]]) -> set[str]:
+    """The containers that count toward the fanout quota.
+
+    ``accesses`` is ``(container_id, rank)`` per access. Only containers touched
+    at rank ≥ READ_SUMMARIZE count, and ``""`` ("no container", see
+    graph.normalizer) never does. Counting every container the session touched
+    let a session with 8 plain READs plus a single READ_SUMMARIZE fire: the
+    rank gate only looked at the session's MAXIMUM rank, so read-only breadth
+    was scored as staging breadth — the thing the rank gate exists to exclude.
+    """
+    return {
+        cid for cid, rank in accesses
+        if cid and rank >= _STAGING_MIN_RANK
+    }
+
+
 def fanout_exceeded(
     tainted: bool,
     container_ids: Iterable[str],
@@ -199,7 +215,14 @@ def fanout_exceeded(
     at rank ≥ READ_SUMMARIZE is a fanout fact — exact counting against a
     declared quota: no cold start, no smoothing, no baseline an attacker can
     walk upward (closes limitation F5 by construction).
+
+    ``container_ids`` must already be the QUALIFYING containers — derive them
+    with :func:`fanout_containers`; this function only sees ids, not the rank
+    each one was touched at, so it cannot filter them itself. ``max_rank`` is
+    kept as the session-level gate (and for callers that pass it), and ``""``
+    ids are ignored here too as a last line of defence.
     """
     if not tainted or max_rank is None or max_rank < _STAGING_MIN_RANK:
         return False
-    return len(set(container_ids)) > policy.fanout_quota_for(source_class)
+    distinct = {cid for cid in container_ids if cid}
+    return len(distinct) > policy.fanout_quota_for(source_class)

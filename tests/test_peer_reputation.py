@@ -51,3 +51,45 @@ def test_snapshot_is_quiet_until_wrong() -> None:
     rep.record_signal("noisy", "send_denied", identity_verified=True)
     snap = rep.snapshot()
     assert list(snap) == ["noisy"] and snap["noisy"]["signals"] == ["send_denied"]
+
+
+def test_out_of_order_signal_does_not_double_decay() -> None:
+    # In order: A@0, B@30. Delivered B then A. The record's clock must not move
+    # back to day 0 — that decayed the whole score again across days 0..30.
+    in_order = PeerReputation()
+    in_order.record_signal("p", "assertion_forged", identity_verified=True, at_days=0.0)
+    in_order.record_signal("p", "send_denied", identity_verified=True, at_days=30.0)
+
+    late = PeerReputation()
+    late.record_signal("p", "send_denied", identity_verified=True, at_days=30.0)
+    late.record_signal("p", "assertion_forged", identity_verified=True, at_days=0.0)
+
+    expected = in_order.score("p", at_days=60.0)
+    assert abs(expected - 0.4375 * 0.5) < 1e-9
+    assert abs(late.score("p", at_days=60.0) - expected) < 1e-9
+
+
+def test_signal_log_is_windowed_and_capped() -> None:
+    from axor_sentinel.sentinel.peer_reputation import (
+        PEER_SIGNAL_CAP,
+        PEER_SIGNAL_WINDOW_DAYS,
+    )
+
+    rep = PeerReputation()
+    for i in range(PEER_SIGNAL_CAP * 3):
+        rep.record_signal("p", "class_probe", identity_verified=True, at_days=i * 0.001)
+    assert len(rep.snapshot()["p"]["signals"]) == PEER_SIGNAL_CAP
+
+    rep.record_signal(
+        "p", "send_denied", identity_verified=True,
+        at_days=PEER_SIGNAL_WINDOW_DAYS + 10.0,
+    )
+    assert rep.snapshot()["p"]["signals"] == ["send_denied"]
+
+
+def test_snapshot_decays_to_now_when_given() -> None:
+    rep = PeerReputation()
+    rep.record_signal("p", "assertion_forged", identity_verified=True, at_days=0.0)
+    assert rep.snapshot()["p"]["score"] == 0.5          # as of the last signal
+    assert abs(rep.snapshot(at_days=30.0)["p"]["score"] - 0.25) < 1e-9
+    assert rep.snapshot(at_days=30.0)["p"]["score"] == rep.score("p", at_days=30.0)

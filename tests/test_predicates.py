@@ -241,3 +241,20 @@ def test_polarity_round_trip_through_enricher_conversion():
     assert rep_watch > floor                   # WATCH does not cross at 0.3
     assert rep_clean == 0.0                    # CLEAN stays "unknown"
     assert 0.0 < rep_flagged <= 0.6 and rep_watch <= 0.6  # floor 0.6 → WATCH also crosses
+
+
+def test_fanout_containers_counts_only_staging_rank_and_skips_empty() -> None:
+    from axor_sentinel.sentinel.predicates import fanout_containers
+
+    got = fanout_containers([
+        ("c_read", SignalType.READ),
+        ("c_sum", SignalType.READ_SUMMARIZE),
+        ("c_exp", SignalType.READ_EXPORT_ADJACENT),
+        ("c_sum", SignalType.READ),            # also READ elsewhere: still counts once
+        ("", SignalType.READ_EXPORT_FAILED),   # "" = no container, never counts
+    ])
+    assert got == {"c_sum", "c_exp"}
+    # fanout_exceeded ignores "" even when a caller passes raw ids.
+    assert not fanout_exceeded(
+        True, [""] * 50 + ["c1"], SignalType.READ_SUMMARIZE, _POLICY,
+    )

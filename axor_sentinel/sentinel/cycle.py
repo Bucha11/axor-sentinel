@@ -35,6 +35,7 @@ from axor_sentinel.sentinel.predicates import (
     Verdict,
     evaluate_container,
     evaluate_resource,
+    fanout_containers,
     fanout_exceeded,
 )
 from axor_sentinel.sentinel.snapshot import (
@@ -145,8 +146,17 @@ class SentinelCycle:
                               control plane (e.g. axor-wrap's
                               ``PlaneConnector.reputation_publisher()``)
             agent_baselines:  agent_id → AgentContainerBaseline (updated in-place)
-            signal_history:   resource_id → list[taint_source] (for diversity factor)
-            prior_counts:     (resource_id, taint_source) → count (for dampening)
+            signal_history:   resource_id → list[origin] (for diversity factor)
+            prior_counts:     (resource_id, origin) → count (for dampening)
+
+        Both counters are WINDOWED like the evidence (policy.window_days): each
+        entry carries the time the cycle applied it, and entries older than the
+        window are pruned every cycle. Seeded or legacy entries without a
+        timestamp are treated as observed at construction/load time, so they
+        expire one window later (see _reconcile_counter_times).
+
+        The Neo4j uniqueness constraints are ensured once here
+        (construct.ensure_schema; idempotent, failures logged, never raised).
         """
         self._neo4j = neo4j_session
         self._snapshot_dir = Path(snapshot_dir)
@@ -182,6 +192,8 @@ class SentinelCycle:
             self._prior_counts: dict[tuple[str, str], int] = prior_counts or {}
             self._current_version: int = 0
             self._evidence = EvidenceStore()
+            self._signal_history_at: dict[str, list[float]] = {}
+            self._prior_counts_at: dict[tuple[str, str], list[float]] = {}
         else:
             # One authenticated read feeds both parsers, so the counters and
             # the attestations always come from the same (verified) file.
@@ -195,8 +207,21 @@ class SentinelCycle:
             self._prior_counts = pc
             self._current_version = ver
             self._evidence = ev
+            self._signal_history_at, self._prior_counts_at = (
+                SentinelCycle._parse_counter_times(raw)
+            )
             if ver > 0:
                 log.info("sentinel: restored persisted state version=%d", ver)
+        # Entries without a timestamp (explicit seeds, or state written before
+        # the counters were windowed) are dated "now": the counts they carry
+        # stay in force for one more window and then expire, instead of either
+        # vanishing on upgrade or — the old behaviour — never expiring at all.
+        self._reconcile_counter_times(time.time())
+
+        # Uniqueness constraints make MERGE an index lookup (not a label scan)
+        # and stop two concurrent writers from creating duplicate nodes for one
+        # id. Idempotent; a failure (older Neo4j, a mock) is logged, not raised.
+        construct.ensure_schema(self._neo4j)
 
         # Versions never go backwards, even when the state file does. The state
         # can be missing, truncated by a crash (pre-atomic writes), rejected by
@@ -310,8 +335,11 @@ class SentinelCycle:
 
         Merge is order-preserving (first occurrence keeps the slot) and is a
         union of evidence: boolean flags OR together, accessed_resources union
-        (deduped by resource_id + container_id + signal_type so a repeated access
-        is not weighted twice), started_at is the earliest, and source_class is
+        (deduped by resource_id + container_id + signal_type — the container is
+        kept in the key because container membership feeds fanout and
+        adjacency; the hot weight is deduped separately, per (session,
+        resource, signal), in the cycle loop, since the graph's ACCESSED edge
+        is keyed by signal only), started_at is the earliest, and source_class is
         taken from the first record that attests one. taint_source keeps the
         first value — it is descriptive evidence only; the poisoning-mitigation
         factors key on the actor origin, not this label (F1).
@@ -383,6 +411,13 @@ class SentinelCycle:
         # to drift from it or to risk an A-3 violation.
         q.apply_decay(self._neo4j, flag_threshold=FLAG_THRESHOLD)
 
+        # Window the poisoning-mitigation counters BEFORE this cycle reads them:
+        # dampening and diversity must describe the same window the evidence
+        # does. Unwindowed, a year of old signals kept origin_dampening at
+        # 0.5^n ≈ 0 for good — the actor's fresh signals weighed nothing
+        # although every fact behind the count had long expired.
+        self._prune_counters(now)
+
         self._reputation_events.clear()
         self._fanout_signals.clear()
         # rid → fanout fact for this cycle's verdict bump (session-scoped burst;
@@ -402,8 +437,8 @@ class SentinelCycle:
                     f"F1:fanout:session={session.session_id}"
                     f":containers={fanout.unique_containers}"
                 )
-                for a in session.accessed_resources:
-                    fanout_facts.setdefault(a.resource_id, fact)
+                for rid in fanout.affected_resources:
+                    fanout_facts.setdefault(rid, fact)
 
             # Poisoning-mitigation factors key on the actor identity (source_class or
             # agent_id), NOT the attacker-controllable taint_source label — rotating
@@ -419,12 +454,30 @@ class SentinelCycle:
                 started_at=session.started_at,
                 tainted=session.had_taint,
                 accesses=session.accessed_resources,
+                # knowledge time: attestation supersession compares against
+                # max(session start, this), so a late-reported session that
+                # started before an attestation still ends its discount
+                ingested_at=now,
             ):
                 self._evidence.add(rid, ev)
 
-            # 2c — apply hot weights per accessed resource
+            # 2c — apply hot weights per accessed resource.
+            # One application per (session, resource, signal): that is the key
+            # of the graph's ACCESSED edge (construct.UPSERT_ACCESS_QUERY), so
+            # the same resource+signal listed under two containers is ONE
+            # access. _dedupe_sessions keeps the container in its key (fanout
+            # and adjacency need membership), and without this guard such a
+            # pair got two apply_hot_weight calls and bumped the dampening /
+            # diversity counters twice.
+            applied: set[tuple[str, SignalType]] = set()
             for access in session.accessed_resources:
                 rid = access.resource_id
+                # Defensive: "" is "no resource" (graph.normalizer); producers
+                # no longer emit it, and a weight on it would land on nothing
+                # while still bumping the counters.
+                if not rid or (rid, access.signal_type) in applied:
+                    continue
+                applied.add((rid, access.signal_type))
                 raw_weight = compute_hot_weight(access.signal_type)
                 history = self._signal_history.get(rid, [])
                 prior = self._prior_counts.get((rid, origin), 0)
@@ -479,9 +532,13 @@ class SentinelCycle:
 
                 # Update signal history and prior counts — keyed on the actor origin
                 # (see `origin` above), so source-label rotation cannot reset them.
+                # Each entry is stamped with the cycle clock (when the weight was
+                # applied) so _prune_counters can expire it with the window.
                 self._signal_history.setdefault(rid, []).append(origin)
+                self._signal_history_at.setdefault(rid, []).append(now)
                 key = (rid, origin)
                 self._prior_counts[key] = self._prior_counts.get(key, 0) + 1
+                self._prior_counts_at.setdefault(key, []).append(now)
 
             # 2d(fanout) — write fanout flat weight to Neo4j (invariant A-10).
             # Applied as a separate accumulate on top of the hot weights; it lands
@@ -520,8 +577,11 @@ class SentinelCycle:
             active = active_attestation(records)
             if active is None:
                 continue
+            # known_at = max(session start, ingest time): what the operator
+            # could have seen at created_at is decided by when Sentinel learned
+            # of a fact, not only when the session began (Evidence docstring).
             if is_superseded(
-                active, (e.observed_at for e in self._evidence.evidence_for(rid))
+                active, (e.known_at for e in self._evidence.evidence_for(rid))
             ):
                 superseded_attestations[rid] = active
             else:
@@ -607,12 +667,12 @@ class SentinelCycle:
                 attested.facts + (f"A2:attested:{active.attestation_id}",),
             )
         for rid, active in superseded_attestations.items():
-            v = resource_verdicts.get(rid)
-            if v is None or v.level == ReputationLevel.CLEAN:
+            sv = resource_verdicts.get(rid)
+            if sv is None or sv.level == ReputationLevel.CLEAN:
                 continue
             resource_verdicts[rid] = Verdict(
-                v.level,
-                v.facts + (
+                sv.level,
+                sv.facts + (
                     f"A2:attestation_superseded_by_newer_evidence:{active.attestation_id}",
                 ),
             )
@@ -707,9 +767,16 @@ class SentinelCycle:
         The taint and signal-rank gates (invariant A-15) are unchanged. The
         z-score against the smoothed per-agent baseline is still computed on an
         emitted signal, but as TELEMETRY only (0.0 when no baseline exists) —
-        it never gates the trigger.
+        it never gates the trigger. ``unique_containers`` is the qualifying
+        count the quota compared; the z-score keeps the all-containers count,
+        the measure update_baseline records, so it compares like with like.
         """
-        containers = {a.container_id for a in session.accessed_resources}
+        # Only containers touched at rank >= READ_SUMMARIZE count, and "" (no
+        # container) never does — fanout_containers. Counting every container
+        # let 8 plain READs plus one READ_SUMMARIZE fire the quota.
+        containers = fanout_containers(
+            (a.container_id, a.signal_type) for a in session.accessed_resources
+        )
         signal_values = [a.signal_type for a in session.accessed_resources]
         max_signal = max(signal_values) if signal_values else None
         if not fanout_exceeded(
@@ -720,8 +787,9 @@ class SentinelCycle:
 
         baseline = self._baselines.get(session.agent_id)
         mean = baseline.mean_containers_per_session if baseline is not None else 0.0
+        touched = {a.container_id for a in session.accessed_resources}
         if baseline is not None and baseline.std_containers_per_session >= 0.01:
-            z_score = (len(containers) - mean) / baseline.std_containers_per_session
+            z_score = (len(touched) - mean) / baseline.std_containers_per_session
         else:
             z_score = 0.0
 
@@ -729,7 +797,13 @@ class SentinelCycle:
             origin_session_id=session.session_id,
             agent_id=session.agent_id,
             taint_source=session.taint_source,
-            affected_resources=[a.resource_id for a in session.accessed_resources],
+            # Every resource the session touched (A-10: the flat weight lands
+            # on all of them, not just the qualifying ones), once each and
+            # never "": one resource under two containers/signals is one
+            # fanout write, not two.
+            affected_resources=list(dict.fromkeys(
+                a.resource_id for a in session.accessed_resources if a.resource_id
+            )),
             unique_containers=len(containers),
             baseline_mean=mean,
             z_score=z_score,
@@ -767,10 +841,23 @@ class SentinelCycle:
         start at version 0.
         """
         try:
+            # A caller may have written the counter dicts directly (tests,
+            # seeding); give every entry its time so the file is consistent.
+            self._reconcile_counter_times(time.time())
             self._snapshot_dir.mkdir(parents=True, exist_ok=True)
             state: dict = {
                 "version": self._current_version,
                 "signal_history": self._signal_history,
+                # Per-entry apply times for the windowed counters, parallel to
+                # signal_history[rid] / one per prior_counts increment. Separate
+                # keys (not a new shape for the old ones) so an older reader
+                # still parses this file and a newer one reads an older file
+                # (missing times → dated at load, _reconcile_counter_times).
+                "signal_history_at": self._signal_history_at,
+                "prior_counts_at": {
+                    f"{rid}\x00{src}": times
+                    for (rid, src), times in self._prior_counts_at.items()
+                },
                 # tuple keys are not JSON-serialisable — encode as "rid\x00src"
                 "prior_counts": {
                     f"{rid}\x00{src}": count
@@ -941,6 +1028,104 @@ class SentinelCycle:
                     continue
                 out.setdefault(record.resource_id, []).append(record)
         return out
+
+    @staticmethod
+    def _parse_counter_times(
+        raw: dict | None,
+    ) -> tuple[dict[str, list[float]], dict[tuple[str, str], list[float]]]:
+        """Per-entry apply times of the windowed counters from an authenticated
+        payload. State written before the counters were windowed has no such
+        keys → ``({}, {})``; the entries it does carry are then dated at load
+        by _reconcile_counter_times (backward compatible, and they still expire
+        one window later). Malformed values are dropped the same way."""
+        if raw is None:
+            return {}, {}
+        sh_at: dict[str, list[float]] = {}
+        stored = raw.get("signal_history_at", {})
+        if isinstance(stored, dict):
+            for rid, times in stored.items():
+                with contextlib.suppress(TypeError, ValueError):
+                    sh_at[str(rid)] = [float(t) for t in times]
+        pc_at: dict[tuple[str, str], list[float]] = {}
+        stored = raw.get("prior_counts_at", {})
+        if isinstance(stored, dict):
+            for key, times in stored.items():
+                rid, sep, src = str(key).partition("\x00")
+                if not sep:
+                    continue
+                with contextlib.suppress(TypeError, ValueError):
+                    pc_at[(rid, src)] = [float(t) for t in times]
+        return sh_at, pc_at
+
+    def _reconcile_counter_times(self, now: float) -> None:
+        """Make every counter entry carry exactly one apply time.
+
+        signal_history[rid] and _signal_history_at[rid] are parallel lists;
+        prior_counts[key] is the length of _prior_counts_at[key]. Entries that
+        arrived without a time — explicit constructor seeds, state from before
+        the counters were windowed, or a caller writing the dicts directly —
+        are dated ``now``. The times are prepended, because the undated
+        entries are the oldest ones (the front of each list); dating them now
+        is the conservative choice — a count is never dropped early, only kept
+        for at most one more window. Surplus
+        times (a count that was lowered by hand) are trimmed oldest-first.
+        Keys whose count reached zero are removed.
+        """
+        for rid, history in self._signal_history.items():
+            times = self._signal_history_at.setdefault(rid, [])
+            if len(times) < len(history):
+                times[:0] = [now] * (len(history) - len(times))
+            elif len(times) > len(history):
+                del times[: len(times) - len(history)]
+        for rid in list(self._signal_history_at):
+            if rid not in self._signal_history:
+                del self._signal_history_at[rid]
+        for key, count in list(self._prior_counts.items()):
+            if count <= 0:
+                del self._prior_counts[key]
+                continue
+            times = self._prior_counts_at.setdefault(key, [])
+            if len(times) < count:
+                times[:0] = [now] * (count - len(times))
+            elif len(times) > count:
+                del times[: len(times) - count]
+        for key in list(self._prior_counts_at):
+            if key not in self._prior_counts:
+                del self._prior_counts_at[key]
+
+    def _prune_counters(self, now: float) -> None:
+        """Drop counter entries applied before the evidence window.
+
+        Uses the same length as the evidence window (policy.window_days), so
+        the dampening / diversity factors describe the same period the verdict
+        layer does. The clock is the time the cycle APPLIED the weight (not the
+        session start): the counters record weight applications, which happen
+        at ingest. Called with the lock held, at the start of each cycle.
+        """
+        self._reconcile_counter_times(now)
+        horizon = now - self._policy.window_days * 86400.0
+        for rid in list(self._signal_history):
+            pairs = [
+                (o, t) for o, t in zip(
+                    self._signal_history[rid], self._signal_history_at[rid],
+                    strict=True,
+                )
+                if t >= horizon
+            ]
+            if pairs:
+                self._signal_history[rid] = [o for o, _ in pairs]
+                self._signal_history_at[rid] = [t for _, t in pairs]
+            else:
+                del self._signal_history[rid]
+                del self._signal_history_at[rid]
+        for key in list(self._prior_counts):
+            kept = [t for t in self._prior_counts_at[key] if t >= horizon]
+            if kept:
+                self._prior_counts[key] = len(kept)
+                self._prior_counts_at[key] = kept
+            else:
+                del self._prior_counts[key]
+                del self._prior_counts_at[key]
 
     def update_baseline(
         self,

@@ -16,11 +16,14 @@ than no-ops against an empty graph.
 """
 from __future__ import annotations
 
+import logging
 from itertools import permutations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from axor_sentinel.sentinel.cycle import SessionSummary
+
+log = logging.getLogger("axor.sentinel.graph")
 
 # Topology factor for resources that share a container.  The spec grades
 # adjacency (same directory/workspace 1.0, same service 0.7, same MCP namespace
@@ -34,16 +37,84 @@ SAME_CONTAINER_TOPOLOGY_FACTOR: float = 1.0
 # query string contains both ``had_taint`` and ``last_signal_at`` — the cycle's
 # query-ordering test matches the hot-weight query by exactly that pair, and a
 # combined upsert would be a false positive.
+#
+# The same session is upserted again whenever a later cycle sees another record
+# for it (e.g. ProbeTaintBridge's minimal drift summary, which carries no export
+# flag and its own started_at).  Plain assignment let that later, thinner record
+# CLEAR had_export_attempt / had_taint and move started_at — un-staging a
+# slow-and-low pair after the fact.  The node is therefore a union of every
+# record ever seen for the session, exactly like cycle._dedupe_sessions within
+# one cycle: boolean facts OR together (a fact, once observed, stays observed)
+# and started_at only moves earlier.
 UPSERT_SESSION_QUERY = """
 MERGE (ag:Agent {agent_id: $agent_id})
 MERGE (s:Session {session_id: $session_id})
-SET s.had_taint = $had_taint,
-    s.had_export_attempt = $had_export_attempt,
-    s.had_failed_export = $had_failed_export,
-    s.had_escalation = $had_escalation,
-    s.started_at = $started_at_ms
+SET s.had_taint = coalesce(s.had_taint, false) OR $had_taint,
+    s.had_export_attempt = coalesce(s.had_export_attempt, false) OR $had_export_attempt,
+    s.had_failed_export = coalesce(s.had_failed_export, false) OR $had_failed_export,
+    s.had_escalation = coalesce(s.had_escalation, false) OR $had_escalation,
+    s.started_at = CASE
+        WHEN s.started_at IS NULL OR $started_at_ms < s.started_at THEN $started_at_ms
+        ELSE s.started_at
+    END
 MERGE (ag)-[:IN_SESSION]->(s)
 """
+
+# Uniqueness constraints for every label the sentinel MERGEs or CREATEs by id.
+# Without them MERGE is a label scan (O(nodes) per upsert, every cycle) and two
+# concurrent writers can both miss and CREATE the same id twice — after which
+# every MATCH on that id fans out over the duplicates and double-applies
+# weights.  A uniqueness constraint is backed by an index, so it fixes both.
+# ``IF NOT EXISTS`` makes them idempotent (safe on every start).
+#
+# Labels as written by this package: Resource.id (construct / queries),
+# Session.session_id and Agent.agent_id (UPSERT_SESSION_QUERY), and
+# Attestation.attestation_id (attestation.ATTEST_BRANCH_QUERY, whose comment
+# already relied on "the unique constraint").  Containers are NOT nodes — they
+# exist only as ADJACENT_TO edges derived from co-membership — so there is no
+# Container constraint to declare.
+SCHEMA_STATEMENTS: tuple[str, ...] = (
+    "CREATE CONSTRAINT sentinel_resource_id IF NOT EXISTS "
+    "FOR (r:Resource) REQUIRE r.id IS UNIQUE",
+    "CREATE CONSTRAINT sentinel_session_id IF NOT EXISTS "
+    "FOR (s:Session) REQUIRE s.session_id IS UNIQUE",
+    "CREATE CONSTRAINT sentinel_agent_id IF NOT EXISTS "
+    "FOR (a:Agent) REQUIRE a.agent_id IS UNIQUE",
+    "CREATE CONSTRAINT sentinel_attestation_id IF NOT EXISTS "
+    "FOR (a:Attestation) REQUIRE a.attestation_id IS UNIQUE",
+)
+
+
+def ensure_schema(session: Any) -> bool:
+    """Idempotently create the sentinel's uniqueness constraints.
+
+    Each statement runs on its own (schema changes cannot share a transaction
+    with each other on every Neo4j version, and one failure should not stop
+    the rest).  A failure — a Neo4j older than 4.4 that does not understand
+    ``IF NOT EXISTS`` / ``FOR … REQUIRE``, a read-only replica, existing
+    duplicate data that violates the constraint, or a test double — is logged
+    and swallowed: the constraints are a performance and race guard, and the
+    cycle must still run without them (exactly as it did before they existed).
+
+    Returns True when every statement was accepted.
+    """
+    ok = True
+    for statement in SCHEMA_STATEMENTS:
+        try:
+            result = session.run(statement)
+            # Drain the result where the driver returns one: with a lazy
+            # driver the statement's error only surfaces on consume().
+            consume = getattr(result, "consume", None)
+            if callable(consume):
+                consume()
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            ok = False
+            log.warning(
+                "sentinel: could not ensure graph schema (%s): %s — continuing "
+                "without it; MERGE falls back to label scans",
+                statement.split(" IF NOT EXISTS")[0], exc,
+            )
+    return ok
 
 # Resource nodes + ACCESSED edges for one session.  ON CREATE seeds the score
 # (and a fresh last_decay_at so the next decay does not treat a brand-new node as

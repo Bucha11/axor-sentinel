@@ -24,7 +24,7 @@ It does this by maintaining a **resource reputation graph** in Neo4j and publish
 
 **Primary threat model:** slow-and-low staging — an agent (or coordinated group of agents) reads from a sensitive resource across many individually-normal sessions, then issues an export. No single session exceeds anomaly thresholds; the cross-session accumulation does.
 
-**Secondary threat model:** fanout — an agent accesses an unusually large number of containers in a single session compared to its historical baseline, which may indicate exploratory pre-staging.
+**Secondary threat model:** fanout — a tainted session touches more distinct containers at rank ≥ `READ_SUMMARIZE` than a declared per-actor-class quota allows (`SentinelPolicy.fanout_containers`, default 7), which may indicate exploratory pre-staging.
 
 ---
 
@@ -110,7 +110,7 @@ axor_sentinel/
 | `:Resource` | `id`, `suspicion_score`, `flagged`, `last_signal_at`, `last_decay_at`, `normalization_method`, `canonical_confidence` | Core tracked entity. `last_signal_at` and `last_decay_at` are separate timestamps (invariant A-3). |
 | `:Container` | `id`, `type`, `suspicion_score`, `flagged` | Directory / workspace / MCP namespace. Score = mean of member resources above threshold. |
 | `:Agent` | `agent_id` | Stable identity across sessions. |
-| `:Session` | `session_id`, `agent_id`, `started_at`, `had_taint`, `had_export_attempt`, `had_failed_export`, `had_escalation` | One governed session. |
+| `:Session` | `session_id`, `agent_id`, `started_at`, `had_taint`, `had_export_attempt`, `had_failed_export`, `had_escalation` | One governed session. Upserted as a union across cycles: the `had_*` flags OR together and `started_at` only moves earlier, so a later, thinner record for the same session (e.g. the probe bridge's drift summary) never clears a flag. |
 | `:Destination` | `id`, `is_external` | Export target. |
 
 ### Edges
@@ -122,6 +122,17 @@ axor_sentinel/
 | `:MEMBER_OF` | Resource → Container | — | Membership for container score aggregation. |
 | `:IN_SESSION` | Agent → Session | — | Links agent to its sessions for cross-session queries. |
 | `:EXPORTED_TO` | Session → Destination | — | Recorded on export attempt. |
+
+As implemented, the sentinel writes `:Agent`, `:Session`, `:Resource` and
+`:Attestation` nodes and `:IN_SESSION` / `:ACCESSED` / `:ADJACENT_TO` /
+`:ATTESTS` edges; containers exist only as `ADJACENT_TO` edges derived from
+co-membership (no `:Container` node). `SentinelCycle.__init__` runs
+`construct.ensure_schema`, which idempotently creates uniqueness constraints
+(`IF NOT EXISTS`) on `Resource.id`, `Session.session_id`, `Agent.agent_id` and
+`Attestation.attestation_id` — MERGE becomes an index lookup and concurrent
+writers cannot duplicate a node. On a server that rejects the statements
+(pre-4.4 syntax, read replica, duplicate data) the failure is logged and the
+cycle runs without them.
 
 ### topology_factor values
 
@@ -283,14 +294,31 @@ factor        = 1.0 − (concentration × 0.7)
 factor = 0.5^prior_count    # 1st=1.0, 2nd=0.5, 3rd=0.25, …
 ```
 
+Both counters (`signal_history`, `prior_counts`) are **windowed** with the
+evidence window (`SentinelPolicy.window_days`): each entry records when the
+cycle applied it and is pruned once older than the window, at the start of
+every cycle. Unwindowed, a year of old signals kept `0.5^prior_count ≈ 0` for
+an actor forever although every fact behind the count had expired. State files
+written before the counters were windowed load intact, with their entries dated
+at load time (they expire one window later).
+
 ### 5.4 Caution weight (adjacent resources)
 
 Resources not directly accessed but topologically adjacent to a hot resource receive a caution weight:
 
 ```
-caution = BASE_CAUTION × topology_factor × time_decay(days_since_last_decay) × canonical_confidence
+caution = BASE_CAUTION × topology_factor × canonical_confidence
 BASE_CAUTION = 0.3
 ```
+
+The spec's `time_decay(days_since_last_decay)` term is 1 at application time
+and is not computed: caution is written in the same cycle as the hot signal
+that causes it, right after `DECAY_QUERY`, so for any scored node the elapsed
+time is ≈ 0. The only nodes for which the term differed were score-0
+neighbours, whose `last_decay_at` is stale by design (§5.5) — there it shrank
+caution by the neighbour's *age*, not by anything about the signal. Ageing of a
+caution contribution is left to `DECAY_QUERY` on later cycles, as for hot
+weights.
 
 ### 5.5 Time decay
 
@@ -301,6 +329,13 @@ decay_factor = 0.5^(days_since_last_decay / 30)
 ```
 
 Applied in Neo4j at the start of every audit cycle (before hot weights) via `DECAY_QUERY`.
+
+`DECAY_QUERY` skips score-0 nodes, so their `last_decay_at` is not advanced.
+Every write that lifts a node off 0 (hot, caution, fanout) therefore restarts
+its decay clock (`last_decay_at = now` when the score before the write was 0):
+`last_decay_at` means "decaying since", and a node that sat at 0 from day 0 to
+day 100 has nothing to decay for those days. Without the restart the first
+decay after a day-100 hit multiplied the fresh score by `0.5^(100/30) ≈ 0.1`.
 
 ### 5.6 Flagging threshold
 
@@ -346,13 +381,16 @@ Applied as a **separate** `accumulate()` call, not folded into `effective_weight
                                    update last_decay_at; leave last_signal_at unchanged
 
 2. For each tainted session:
-   a. Fanout detection  → check z-score vs AgentContainerBaseline
+   a. Fanout detection  → declared quota (predicates.fanout_exceeded)
                           guard: session.had_taint = True (A-15)
-                          guard: session_count ≥ 10 (cold-start, A-14)
                           guard: max signal_type ≥ READ_SUMMARIZE (A-15)
-                          z > 2.5 → emit FanoutSignal
+                          count: DISTINCT containers touched at rank ≥ READ_SUMMARIZE
+                                 (predicates.fanout_containers; "" never counts)
+                          > policy.fanout_quota_for(source_class) → emit FanoutSignal
+                          (z-score vs AgentContainerBaseline = telemetry only)
 
-   b. Hot weights       → per accessed resource:
+   b. Hot weights       → once per (session, resource, signal) — the ACCESSED
+                          edge's key; "" resource ids skipped:
                           compute raw×diversity×dampening pre-scale
                           HOT_WEIGHT_QUERY → Neo4j (Cypher accumulates and multiplies
                           by canonical_confidence — A-8); returns before/after
@@ -374,21 +412,22 @@ Applied as a **separate** `accumulate()` call, not folded into `effective_weight
 ### Fanout detection detail
 
 ```python
-z_score = (unique_containers − baseline.mean) / baseline.std
+qualifying = fanout_containers((a.container_id, a.signal_type) for a in accesses)
+#   = {cid for cid, rank in ... if cid and rank >= READ_SUMMARIZE}
 
-# Special case: std ≈ 0 (very regular agent)
-if std < 0.01:
-    if unique_containers ≤ mean + FANOUT_MIN_DELTA(3):
-        return None      # not a fanout
-    z_score = inf        # clearly anomalous
-
-# Trigger condition (all three required — A-15):
+# Trigger condition (all required — A-15):
 # 1. had_taint
-# 2. z_score > 2.5
-# 3. max signal_type ≥ READ_SUMMARIZE
+# 2. max signal_type ≥ READ_SUMMARIZE
+# 3. len(qualifying) > policy.fanout_quota_for(source_class)   # default 7
 ```
 
-Baseline is updated with exponential smoothing (α=0.3) after each session window of 50 sessions.
+Containers touched only at `READ` do not count: read-only breadth is not
+staging breadth (8 READ containers + 1 READ_SUMMARIZE container is 1, not 9).
+The flat fanout weight (A-10) still lands on every resource the session touched,
+each once. `FanoutSignal.unique_containers` is the qualifying count; its
+`z_score` against the smoothed per-agent `AgentContainerBaseline` (α=0.3, last
+50 sessions, all containers) is telemetry only — no warm-up guard exists or is
+needed, since a declared quota needs no history.
 
 ---
 
@@ -517,7 +556,7 @@ handoff in core today; those were removed.
 
 **Pattern:** Single agent accesses an unusually large number of containers in one session (broad reconnaissance), with `signal_type >= READ_SUMMARIZE`.
 
-**Detection mechanism:** z-score of unique containers touched vs agent's historical baseline. Requires cold-start guard (≥10 sessions of history) to prevent false positives on new agents.
+**Detection mechanism:** declared quota — more than `fanout_quota_for(source_class)` distinct containers touched at rank ≥ `READ_SUMMARIZE` in one tainted session (§6). No baseline and no cold-start guard: the quota needs no history, and there is nothing an attacker can walk upward.
 
 **Config variants in bench:** 3, 5, 10 containers.
 
@@ -535,19 +574,19 @@ handoff in core today; those were removed.
 |---|---|---|
 | A-1 | `suspicion_score` ∈ [0, 1] always | `accumulate()` in `weight.py` |
 | A-2 | `flagged` updated on every score change, never deferred | `update_resource_score()`, Cypher queries |
-| A-3 | Decay uses `last_decay_at`; signal events use `last_signal_at`; they are never swapped | `DECAY_QUERY` updates `last_decay_at`; `HOT_WEIGHT_QUERY` updates `last_signal_at` |
+| A-3 | Decay uses `last_decay_at`; signal events use `last_signal_at`; they are never swapped | `DECAY_QUERY` updates `last_decay_at`; `HOT_WEIGHT_QUERY` updates `last_signal_at` (and restarts `last_decay_at` only when lifting a score-0 node, §5.5) |
 | A-4 | Decay runs first in every audit cycle, before any hot weight | `cycle.py`: `apply_decay()` before session loop |
 | A-5 | Checksum verified from in-memory bytes before snapshot is made visible | `atomic_swap()`: `_verify_checksum_bytes(serialized.encode(), checksum)` |
 | A-6 | No Neo4j call on the hot path | `SnapshotIntentEnricher.enrich()` reads dict only |
 | A-7 | `flagged` is never exposed as a feature on the intent | `NormalizedIntent` has no `flagged` field |
 | A-8 | `effective_weight = raw × confidence × diversity × dampening` | `compute_effective_weight()` in `weight.py` |
 | A-9 | Container score recomputed after every member score change | `cycle.run_once()` step 2f |
-| A-10 | Fanout flat 0.5 applied as separate `accumulate()` after hot weight | `cycle.py` lines 172–174 |
+| A-10 | Fanout flat 0.5 applied as separate `accumulate()` after hot weight | `SentinelCycle._run_once_locked` step "2d(fanout)": `q.apply_fanout_weight(... fanout.affected_resources ...)` after the per-access hot-weight loop |
 | A-11 | Reputation is observe-only — it never denies | core `record_detection` is tightening-only, no deny path |
 | A-12 | Reputation acts only via the opt-in degradation floor | `detection_floor` unset → `record_detection` is a no-op |
 | A-13 | `origin_dampening` never zero, never > 1 | `0.5^n ∈ (0, 1]` for all n ≥ 0 |
-| A-14 | Fanout detection disabled for agents with < 10 sessions | `_check_fanout()`: `baseline.session_count < FANOUT_MIN_SESSIONS → None` |
-| A-15 | Fanout requires: `had_taint AND z > 2.5 AND signal ≥ READ_SUMMARIZE` | `_check_fanout()` checks all three |
+| A-14 | *(retired)* There is no fanout warm-up guard: the trigger is a declared quota, which needs no history (no cold-start gap to guard) | `predicates.fanout_exceeded` takes no baseline |
+| A-15 | Fanout requires: `had_taint AND max signal ≥ READ_SUMMARIZE AND count(containers at rank ≥ READ_SUMMARIZE) > quota` | `_check_fanout()` → `predicates.fanout_containers` + `fanout_exceeded` |
 | A-16 | Snapshot write is atomic: symlink rename (POSIX) / `os.replace` (Windows) | `atomic_swap()` in `snapshot.py` |
 | A-17 | `validate_snapshot_dir()` warns if path is a network mount | `_warn_if_network_mount()` reads `/proc/mounts` |
 

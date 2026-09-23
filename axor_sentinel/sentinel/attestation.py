@@ -211,9 +211,13 @@ def is_superseded(record: AttestationRecord, observed_at: Iterable[float]) -> bo
     instant was, by construction, visible to the operator. A record with no
     timestamp (created_at <= 0, never stamped) is treated as older than any
     evidence — an undated attestation must not outlive new evidence.
-    Evidence timestamps are session start times (Evidence.observed_at); a
-    session that STARTED before the attestation but was reported after it
-    does not supersede — the residual of comparing by fact time.
+
+    The cycle passes Evidence.known_at — max(session start, ingest time) — not
+    the bare session start: a session that STARTED before the attestation but
+    was only reported (ingested) after it is still evidence the operator never
+    saw, and comparing by fact time alone let such a late report leave the
+    discount in place. Evidence persisted before ingest times existed has
+    known_at == observed_at, i.e. the old comparison.
     """
     return any(t > record.created_at for t in observed_at)
 

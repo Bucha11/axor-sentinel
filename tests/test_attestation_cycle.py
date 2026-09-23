@@ -131,8 +131,12 @@ def test_revocation_restores_exported_score(cycle: SentinelCycle) -> None:
 # These drive real verdicts through run_once with _MockNeo4j (test_cycle.py):
 # sessions whose accesses are READ_EXPORT_FAILED fire P1 → FLAGGED, so an
 # attestation's one-level descent and its lapse are both observable on the
-# wire. Timestamps are set explicitly (started_at / created_at) so "newer" is
-# never decided by clock resolution.
+# wire. Session start times are set explicitly; supersession compares an
+# attestation against Evidence.known_at = max(session start, INGEST time), and
+# the ingest time is the cycle's clock. So an attestation meant to cover the
+# evidence already ingested is stamped by attest() itself (created_at=0.0 →
+# the cycle clock, which is never earlier than a previous cycle's), not
+# back-dated: back-dating before an ingest now (by design) makes it lapse.
 
 _RID = "res_x"
 
@@ -170,12 +174,13 @@ def test_newer_evidence_supersedes_attestation(tmp_path: Path) -> None:
     flagged = c.run_once(sessions=[_export_denied("agent_a", now - 100)])
     assert flagged.resource_level[_RID] == "FLAGGED"
 
-    c.attest(_rec("a1", created_at=now - 50))
+    c.attest(_rec("a1", created_at=0.0))
     attested = c.run_once(sessions=[])
     assert attested.resource_level[_RID] == "WATCH"
     assert "A2:attested:a1" in attested.verdict_facts[_RID]
 
-    refired = c.run_once(sessions=[_export_denied("agent_b", now)])
+    # Started after the attestation (fact time alone would supersede).
+    refired = c.run_once(sessions=[_export_denied("agent_b", time.time() + 1)])
     assert refired.resource_level[_RID] == "FLAGGED"
     assert refired.resource_reputation[_RID] == pytest.approx(
         LEVEL_SUSPICION[ReputationLevel.FLAGGED]
@@ -191,10 +196,13 @@ def test_newer_evidence_supersedes_attestation(tmp_path: Path) -> None:
 def test_evidence_at_attestation_instant_does_not_supersede(tmp_path: Path) -> None:
     # Strictly newer: a fact stamped at the attestation instant was visible
     # to the operator.
+    # The instant compared is the fact's known_at (max of session start and
+    # ingest time), so the attestation is stamped exactly at that.
     now = time.time()
     c = _mock_cycle(tmp_path)
     c.run_once(sessions=[_export_denied("agent_a", now - 10)])
-    c.attest(_rec("a1", created_at=now - 10))
+    (ev,) = c._evidence.evidence_for(_RID)
+    c.attest(_rec("a1", created_at=ev.known_at))
     assert c.run_once(sessions=[]).resource_level[_RID] == "WATCH"
 
 
@@ -219,9 +227,9 @@ def test_fact_names_applied_attestation_not_revocation(tmp_path: Path) -> None:
     now = time.time()
     c = _mock_cycle(tmp_path)
     c.run_once(sessions=[_export_denied("agent_a", now - 100)])
-    c.attest(_rec("a1", created_at=now - 60))
-    c.attest(_rec("a2", created_at=now - 50))
-    c.attest(_rec("a3", created_at=now - 40, revokes="a2"))
+    c.attest(_rec("a1", created_at=0.0))
+    c.attest(_rec("a2", created_at=0.0))
+    c.attest(_rec("a3", created_at=0.0, revokes="a2"))
     assert c.attestations_for(_RID)[0].attestation_id == "a3"
     snap = c.run_once(sessions=[])
     assert snap.resource_level[_RID] == "WATCH"
@@ -235,8 +243,8 @@ def test_attestations_survive_restart_signed(tmp_path: Path, monkeypatch) -> Non
     now = time.time()
     c = _mock_cycle(tmp_path, explicit=False)
     c.run_once(sessions=[_export_denied("agent_a", now - 100)])
-    c.attest(_rec("a1", created_at=now - 50, org="acme"))
-    c.attest(_rec("a2", created_at=now - 40, revokes="a1", org="rogue"))
+    c.attest(_rec("a1", created_at=0.0, org="acme"))
+    c.attest(_rec("a2", created_at=0.0, revokes="a1", org="rogue"))
     assert c.run_once(sessions=[]).resource_level[_RID] == "WATCH"
 
     # The signed envelope carries them (and the payload is HMAC-covered).
@@ -291,3 +299,53 @@ def test_invalid_persisted_attestation_is_skipped(tmp_path: Path, monkeypatch) -
     p.write_text(json.dumps({"version": 1, "attestations": {_RID: [good, bad]}}))
     loaded = SentinelCycle.load_attestations(p)
     assert [r.attestation_id for r in loaded[_RID]] == ["a1"]
+
+
+# ── Supersession by INGEST time, not only session start ─────────────────────
+
+def test_late_reported_session_supersedes_attestation(tmp_path: Path) -> None:
+    # A session that STARTED before the attestation but was only reported
+    # (ingested) after it is evidence the operator never saw. Compared by
+    # session start alone it left the discount in place.
+    now = time.time()
+    c = _mock_cycle(tmp_path)
+    c.run_once(sessions=[_export_denied("agent_a", now - 100)])
+    c.attest(_rec("a1", created_at=0.0))            # stamped now
+    assert c.run_once(sessions=[]).resource_level[_RID] == "WATCH"
+
+    late = _export_denied("agent_b", now - 50)      # started BEFORE a1
+    snap = c.run_once(sessions=[late])
+    assert snap.resource_level[_RID] == "FLAGGED"
+    assert "A2:attestation_superseded_by_newer_evidence:a1" in snap.verdict_facts[_RID]
+
+
+def test_replayed_session_does_not_supersede(tmp_path: Path) -> None:
+    # Re-reporting an ALREADY-ingested session is no new knowledge: the store
+    # keeps the first record (and its ingest time), so the discount stands.
+    now = time.time()
+    c = _mock_cycle(tmp_path)
+    sess = _export_denied("agent_a", now - 100)
+    c.run_once(sessions=[sess])
+    c.attest(_rec("a1", created_at=0.0))
+    assert c.run_once(sessions=[sess]).resource_level[_RID] == "WATCH"
+
+
+def test_window_still_uses_session_time(tmp_path: Path) -> None:
+    # Ingest time does not extend a fact's life: a session that started
+    # outside the window is pruned even though it was ingested just now.
+    c = _mock_cycle(tmp_path)
+    ancient = _export_denied("agent_a", time.time() - 40 * 86400)
+    snap = c.run_once(sessions=[ancient])
+    assert _RID not in snap.resource_level
+
+
+def test_evidence_ingest_time_is_backward_compatible() -> None:
+    legacy = {  # persisted before ingested_at existed
+        "origin": "o", "session_id": "s", "rank": SignalType.READ.value,
+        "tainted": True, "observed_at": 123.0, "resolution": "path",
+    }
+    ev = Evidence.from_json(legacy)
+    assert ev.ingested_at == 0.0 and ev.known_at == 123.0
+    fresh = dataclasses.replace(ev, ingested_at=456.0)
+    assert Evidence.from_json(fresh.to_json()) == fresh
+    assert fresh.known_at == 456.0

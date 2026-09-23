@@ -147,3 +147,41 @@ class TestZScoreTelemetry:
         sig = cycle._check_fanout(_make_session("a", _QUOTA + 1), 0.0)
         assert sig is not None
         assert sig.z_score < 0
+
+
+class TestOnlyQualifyingContainersCount:
+    """The quota counts DISTINCT containers touched at rank >= READ_SUMMARIZE.
+
+    Regression: the container set used to include every container the session
+    touched, and the rank gate only looked at the session's maximum rank — so 8
+    plain READs plus a single READ_SUMMARIZE fired a quota of 7."""
+
+    @staticmethod
+    def _mixed(n_read: int, n_summarize: int) -> SessionSummary:
+        s = _make_session("mixed", 0)
+        s.accessed_resources = [
+            ResourceAccess(f"rr{i}", f"cr{i}", 1.0, SignalType.READ)
+            for i in range(n_read)
+        ] + [
+            ResourceAccess(f"rs{i}", f"cs{i}", 1.0, SignalType.READ_SUMMARIZE)
+            for i in range(n_summarize)
+        ]
+        return s
+
+    def test_read_breadth_plus_one_summarize_does_not_fire(self):
+        assert _QUOTA == 7
+        assert _cycle()._check_fanout(self._mixed(8, 1), 0.0) is None
+
+    def test_qualifying_breadth_fires_and_reports_qualifying_count(self):
+        sig = _cycle()._check_fanout(self._mixed(8, _QUOTA + 1), 0.0)
+        assert sig is not None
+        assert sig.unique_containers == _QUOTA + 1
+        # A-10: the flat weight still lands on EVERY touched resource.
+        assert len(sig.affected_resources) == 8 + _QUOTA + 1
+
+    def test_empty_container_id_never_counts(self):
+        s = _make_session("a", _QUOTA)          # exactly at quota
+        s.accessed_resources.append(
+            ResourceAccess("r_extra", "", 1.0, SignalType.READ_SUMMARIZE)
+        )
+        assert _cycle()._check_fanout(s, 0.0) is None

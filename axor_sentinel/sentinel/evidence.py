@@ -46,6 +46,21 @@ class Evidence:
     rank is the graded involvement depth (SignalType — an ORDER, not a weight);
     tainted is core's session taint fact; resolution is the resource-id
     normalization tier ("heuristic" caps the reachable level, see predicates).
+
+    Two clocks, two jobs:
+
+    - ``observed_at`` is the FACT time (the session's start). Windowing
+      (EvidenceStore.prune, evaluate_resource) and the P4 read-then-export
+      ordering use it: whether a fact is inside the 30-day window, and which
+      of two sessions came first, are properties of when the behaviour
+      happened, not of when a report of it reached us.
+    - ``ingested_at`` is the KNOWLEDGE time (when the cycle first folded the
+      fact in). Attestation supersession uses :attr:`known_at`: an operator
+      vouches for what Sentinel had seen at ``created_at``, and a session that
+      started before the attestation but was only reported after it is still
+      evidence the operator never saw. With fact time alone such a late report
+      never ended the discount. 0.0 = unknown (records persisted before the
+      field existed), which falls back to ``observed_at`` — the old behaviour.
     """
     origin: str          # mitigation_origin: source_class | agent_id (F1 keying)
     session_id: str
@@ -53,6 +68,15 @@ class Evidence:
     tainted: bool
     observed_at: float
     resolution: str      # "provider_id" | "path" | "heuristic"
+    ingested_at: float = 0.0
+
+    @property
+    def known_at(self) -> float:
+        """When Sentinel could first have known this fact: the later of the
+        fact time and the ingest time. What attestation supersession compares
+        against (never earlier than observed_at, so a record without an ingest
+        time behaves exactly as before)."""
+        return max(self.observed_at, self.ingested_at)
 
     def to_json(self) -> dict:
         return {
@@ -62,6 +86,7 @@ class Evidence:
             "tainted": self.tainted,
             "observed_at": self.observed_at,
             "resolution": self.resolution,
+            "ingested_at": self.ingested_at,
         }
 
     @classmethod
@@ -73,6 +98,9 @@ class Evidence:
             tainted=bool(obj["tainted"]),
             observed_at=float(obj["observed_at"]),
             resolution=str(obj.get("resolution", "path")),
+            # Absent in state written before ingest times were recorded; 0.0
+            # makes known_at fall back to observed_at (the old comparison).
+            ingested_at=float(obj.get("ingested_at", 0.0)),
         )
 
 
@@ -141,8 +169,13 @@ def evidence_from_session(
     started_at: float,
     tainted: bool,
     accesses: Iterable,  # Iterable[cycle.ResourceAccess] — no import cycle
+    ingested_at: float = 0.0,
 ) -> list[tuple[str, Evidence]]:
     """Map one session's accesses to (resource_id, Evidence) pairs.
+
+    ``started_at`` becomes the fact time (``observed_at``); ``ingested_at`` is
+    the cycle's clock when it folds the session in (see Evidence — it is what
+    attestation supersession reads). Omitted, it stays 0.0 (unknown).
 
     Accesses with an empty ``resource_id`` are dropped: ``""`` means "no resource"
     (graph.normalizer), and evidence filed under it would be one verdict shared by
@@ -161,6 +194,7 @@ def evidence_from_session(
                 tainted=tainted,
                 observed_at=started_at,
                 resolution=resolution_from_confidence(access.canonical_confidence),
+                ingested_at=ingested_at,
             ),
         ))
     return out

@@ -721,3 +721,192 @@ class TestStateLocking:
                 stop.set()
                 worker.join(timeout=5)
         assert not [r for r in caplog.records if "failed to save state" in r.getMessage()]
+
+
+# ── Hot weight once per (session, resource, signal) ───────────────────────────
+
+class TestHotWeightDedupe:
+    """The graph's ACCESSED edge is keyed by signal only, so one resource+signal
+    listed under two containers is ONE access: one hot write, one count."""
+
+    def test_same_resource_signal_in_two_containers_weighs_once(
+        self, tmp_path: Path,
+    ) -> None:
+        cycle, neo4j = _cycle(tmp_path)
+        sess = _session("a", [
+            ("r1", "c1", 1.0, SignalType.READ_SUMMARIZE),
+            ("r1", "c2", 1.0, SignalType.READ_SUMMARIZE),
+        ])
+        cycle.run_once([sess])
+        hot = [p for q, p in neo4j.calls if "had_taint" in q and "$raw_weight" in q]
+        assert [p["resource_id"] for p in hot] == ["r1"]
+        assert cycle._prior_counts[("r1", "a")] == 1
+        assert cycle._signal_history["r1"] == ["a"]
+
+    def test_distinct_signals_on_one_resource_still_both_apply(
+        self, tmp_path: Path,
+    ) -> None:
+        cycle, neo4j = _cycle(tmp_path)
+        sess = _session("a", [
+            ("r1", "c1", 1.0, SignalType.READ),
+            ("r1", "c1", 1.0, SignalType.READ_SUMMARIZE),
+        ])
+        cycle.run_once([sess])
+        hot = [p for q, p in neo4j.calls if "had_taint" in q and "$raw_weight" in q]
+        assert sorted(p["signal_type"] for p in hot) == ["read", "read_summarize"]
+
+    def test_empty_resource_id_is_skipped(self, tmp_path: Path) -> None:
+        cycle, neo4j = _cycle(tmp_path)
+        cycle.run_once([_session("a", [("", "c1", 1.0, SignalType.READ)])])
+        hot = [p for q, p in neo4j.calls if "had_taint" in q and "$raw_weight" in q]
+        assert hot == []
+        assert cycle._prior_counts == {} and cycle._signal_history == {}
+
+    def test_fanout_affected_resources_are_deduplicated(self, tmp_path: Path) -> None:
+        cycle, neo4j = _cycle(tmp_path)
+        n = cycle._policy.fanout_containers + 1
+        res = [(f"r{i}", f"c{i}", 1.0, SignalType.READ_SUMMARIZE) for i in range(n)]
+        # r0 again under another container and signal, plus a path-less access.
+        res += [
+            ("r0", "c_extra", 1.0, SignalType.READ_EXPORT_ADJACENT),
+            ("", "c_blank", 1.0, SignalType.READ_SUMMARIZE),
+        ]
+        cycle.run_once([_session("a", res)])
+        (sig,) = cycle._fanout_signals
+        assert sig.affected_resources == [f"r{i}" for i in range(n)]
+        (ids,) = [p["resource_ids"] for q, p in neo4j.calls if "$fanout_weight" in q]
+        assert ids == sig.affected_resources
+
+
+# ── Windowed dampening / diversity counters ───────────────────────────────────
+
+_DAY = 86400.0
+
+
+class TestCountersAreWindowed:
+    """signal_history / prior_counts expire with the evidence window: a year of
+    old signals must not keep origin_dampening at 0.5^n ≈ 0 for good."""
+
+    def test_entries_older_than_the_window_are_pruned(self, tmp_path: Path) -> None:
+        cycle, neo4j = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        n_old = 12   # enough for 0.5^n to make a fresh signal negligible
+        for i in range(n_old):
+            s = _session("a", res)
+            s.session_id = f"old{i}"
+            cycle.run_once([s])
+        assert cycle._prior_counts[("r1", "a")] == n_old
+        # Age every entry past the window, as a year of wall time would.
+        old = time.time() - (cycle._policy.window_days + 1) * _DAY
+        cycle._signal_history_at["r1"] = [old] * n_old
+        cycle._prior_counts_at[("r1", "a")] = [old] * n_old
+
+        neo4j.calls.clear()
+        cycle.run_once([_session("a", res)])
+
+        # The fresh signal is weighed as the first one in the window (no
+        # dampening, no concentration penalty) — not by 0.3 * 0.5^12.
+        (hot,) = [p for q, p in neo4j.calls if "had_taint" in q and "$raw_weight" in q]
+        from axor_sentinel.sentinel.weight import compute_hot_weight
+        assert hot["raw_weight"] == pytest.approx(compute_hot_weight(SignalType.READ))
+        assert cycle._prior_counts == {("r1", "a"): 1}
+        assert cycle._signal_history == {"r1": ["a"]}
+
+    def test_entries_inside_the_window_are_kept(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        res = [("r1", "c1", 1.0, SignalType.READ)]
+        cycle.run_once([_session("a", res)])
+        recent = time.time() - (cycle._policy.window_days - 1) * _DAY
+        cycle._prior_counts_at[("r1", "a")] = [recent]
+        cycle._signal_history_at["r1"] = [recent]
+        cycle.run_once([])
+        assert cycle._prior_counts == {("r1", "a"): 1}
+
+    def test_times_round_trip_through_state(self, tmp_path: Path) -> None:
+        cycle, _ = _cycle(tmp_path)
+        cycle.run_once([_session("a", [("r1", "c1", 1.0, SignalType.READ)])])
+        restored = SentinelCycle(_MockNeo4j(), tmp_path)   # loads from disk
+        assert restored._prior_counts_at == cycle._prior_counts_at
+        assert restored._signal_history_at == cycle._signal_history_at
+
+    def test_legacy_state_without_times_is_dated_at_load(self, tmp_path: Path) -> None:
+        import json
+
+        (tmp_path / "sentinel_state.json").write_text(json.dumps({
+            "version": 3,
+            "signal_history": {"r9": ["a", "a"]},
+            "prior_counts": {"r9\x00a": 2},
+            "baselines": {},
+        }), encoding="utf-8")
+        before = time.time()
+        cycle = SentinelCycle(_MockNeo4j(), tmp_path)
+        # Loaded intact, dated "now": kept for one more window, then expire.
+        assert cycle._prior_counts == {("r9", "a"): 2}
+        assert len(cycle._prior_counts_at[("r9", "a")]) == 2
+        assert all(t >= before for t in cycle._signal_history_at["r9"])
+        cycle.run_once([])
+        assert cycle._prior_counts == {("r9", "a"): 2}
+        saved = json.loads((tmp_path / "sentinel_state.json").read_text())
+        assert len(saved["prior_counts_at"]["r9\x00a"]) == 2
+
+
+# ── Neo4j schema (uniqueness constraints) ─────────────────────────────────────
+
+class TestEnsureSchema:
+    def test_constraints_issued_once_at_init(self, tmp_path: Path) -> None:
+        cycle, neo4j = _cycle(tmp_path)
+        schema = [q for q, _ in neo4j.calls if q.startswith("CREATE CONSTRAINT")]
+        assert all("IF NOT EXISTS" in q and "IS UNIQUE" in q for q in schema)
+        for label, prop in [
+            ("Resource", "id"), ("Session", "session_id"),
+            ("Agent", "agent_id"), ("Attestation", "attestation_id"),
+        ]:
+            assert any(f":{label})" in q and f".{prop} IS UNIQUE" in q for q in schema)
+        n = len(schema)
+        cycle.run_once([_session("a", [("r1", "c1", 1.0, SignalType.READ)])])
+        again = [q for q, _ in neo4j.calls if q.startswith("CREATE CONSTRAINT")]
+        assert len(again) == n   # not per cycle
+
+    def test_schema_failure_is_logged_not_raised(self, tmp_path: Path, caplog) -> None:
+        class _OldNeo4j(_MockNeo4j):
+            def run(self, query: str, **params):  # noqa: ANN001
+                if query.startswith("CREATE CONSTRAINT"):
+                    raise RuntimeError("Invalid input 'IF'")
+                return super().run(query, **params)
+
+        with caplog.at_level("WARNING"):
+            cycle = SentinelCycle(_OldNeo4j(), tmp_path, agent_baselines={})
+        assert "could not ensure graph schema" in caplog.text
+        cycle.run_once([])   # the cycle still works without the constraints
+
+
+# ── Cypher contracts that need a live Neo4j to execute ────────────────────────
+# (behaviour is exercised in tests/test_neo4j_integration.py; these pin the
+# query shape so the fix cannot silently regress where Neo4j is unavailable)
+
+class TestCypherContracts:
+    def test_session_upsert_unions_flags_and_keeps_earliest_start(self) -> None:
+        from axor_sentinel.graph.construct import UPSERT_SESSION_QUERY as Q
+
+        for flag in ("had_taint", "had_export_attempt", "had_failed_export",
+                     "had_escalation"):
+            assert f"s.{flag} = coalesce(s.{flag}, false) OR ${flag}" in Q
+        assert "s.started_at = $started_at_ms" not in Q
+        assert "$started_at_ms < s.started_at" in Q
+
+    def test_weight_writes_restart_decay_clock_from_zero(self) -> None:
+        from axor_sentinel.graph import queries as gq
+
+        for Q in (gq.HOT_WEIGHT_QUERY, gq.CAUTION_ADJACENT_QUERY,
+                  gq.FANOUT_WEIGHT_QUERY):
+            assert "last_decay_at = CASE" in Q
+            assert "coalesce(score_before, 0.0) <= 0.0 THEN timestamp()" in Q
+        # Caution no longer shrinks by the neighbour's age since last decay.
+        assert "last_decay_at) / 86400000" not in gq.CAUTION_ADJACENT_QUERY
+
+    def test_slow_and_low_returns_documented_keys_and_skips_blank_agent(self) -> None:
+        from axor_sentinel.graph.queries import SLOW_AND_LOW_QUERY as Q
+
+        assert "ag.agent_id AS agent_id" in Q
+        assert "AS `s1.session_id`" in Q and "AS `s2.session_id`" in Q
+        assert "ag.agent_id <> ''" in Q
