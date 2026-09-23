@@ -7,6 +7,7 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from axor_sentinel.sentinel.snapshot import (
     ReputationSnapshot,
     atomic_swap,
     sign_blob,
+    snapshot_payload,
     validate_snapshot_dir,
     verify_blob,
 )
@@ -128,11 +130,17 @@ class SentinelCycle:
         signal_history: dict[str, list[str]] | None = None,
         prior_counts: dict[tuple[str, str], int] | None = None,
         policy: SentinelPolicy | None = None,
+        publish: Callable[[dict], None] | None = None,
     ) -> None:
         """
         Args:
             neo4j_session:    live neo4j.Session for graph operations
             snapshot_dir:     directory for atomic snapshot writes
+            publish:          optional; called with ``snapshot_payload(snapshot)``
+                              after each snapshot is made visible on disk — the
+                              hook a node uses to report its reputation to a
+                              control plane (e.g. axor-wrap's
+                              ``PlaneConnector.reputation_publisher()``)
             agent_baselines:  agent_id → AgentContainerBaseline (updated in-place)
             signal_history:   resource_id → list[taint_source] (for diversity factor)
             prior_counts:     (resource_id, taint_source) → count (for dampening)
@@ -155,6 +163,7 @@ class SentinelCycle:
         # counters and agent baselines survive process restarts.
         # Declared predicate constants for the deterministic verdict layer.
         self._policy = policy or SentinelPolicy()
+        self._publish = publish
         if agent_baselines is not None or signal_history is not None or prior_counts is not None:
             self._baselines: dict[str, AgentContainerBaseline] = agent_baselines or {}
             self._signal_history: dict[str, list[str]] = signal_history or {}
@@ -177,6 +186,24 @@ class SentinelCycle:
         # Done in __init__ so operators learn about the misconfiguration at startup,
         # not at the first write hours later.
         validate_snapshot_dir(self._snapshot_dir)
+
+    def _publish_snapshot(self, snapshot: ReputationSnapshot) -> None:
+        """Hand the snapshot to the node's reporter, if one is wired.
+
+        After the swap, never before: the local enricher is the consumer that
+        enforces, and what a control plane renders must be what it already
+        reads. A reporter that fails is logged and swallowed — reporting is
+        observation, and a plane being down must not fail the audit cycle that
+        feeds the node's own governance."""
+        if self._publish is None:
+            return
+        try:
+            self._publish(snapshot_payload(snapshot))
+        except Exception:  # noqa: BLE001 — see docstring
+            log.warning(
+                "sentinel: publishing snapshot version=%d failed",
+                snapshot.version, exc_info=True,
+            )
 
     # ── Operator attestations (UI spec 8.1.1) ──────────────────────────────────
 
@@ -527,12 +554,14 @@ class SentinelCycle:
             },
             resource_score_telemetry=final_scores,
             container_score_telemetry=container_scores,
+            # canonical level names, the vocabulary the wire validates
+            # against (`snapshot_from_payload`); lower-cased they were refused
             resource_level={
-                rid: lvl.name.lower() for rid, lvl in resource_levels.items()
+                rid: lvl.name for rid, lvl in resource_levels.items()
                 if lvl > ReputationLevel.CLEAN
             },
             container_level={
-                cid: lvl.name.lower() for cid, lvl in container_levels.items()
+                cid: lvl.name for cid, lvl in container_levels.items()
                 if lvl > ReputationLevel.CLEAN
             },
             verdict_facts={
@@ -547,6 +576,7 @@ class SentinelCycle:
         # would see two distinct snapshots at the same version).
         self.save_state()
         atomic_swap(self._snapshot_dir, snapshot)
+        self._publish_snapshot(snapshot)
 
         log.info(
             "sentinel cycle complete: version=%d resources=%d containers=%d events=%d",

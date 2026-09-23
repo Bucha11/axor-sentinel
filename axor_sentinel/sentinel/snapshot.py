@@ -229,14 +229,22 @@ def snapshot_from_payload(payload: object) -> ReputationSnapshot:
                     f"emits a finite codomain"
                 )
 
+    # Level names are canonical UPPERCASE on the wire. The cycle wrote them
+    # lower-cased (`lvl.name.lower()`) until 0.4.2, so a real cycle's snapshot
+    # was refused here as "not a level" and no node could ever report one.
+    # Accept either spelling from a sender, hand back the canonical one.
+    normalised: dict[str, dict[str, str]] = {}
     for name in ("resource_level", "container_level"):
         got = getattr(snapshot, name)
         if not isinstance(got, dict) or not all(
-            isinstance(k, str) and v in _LEVEL_NAMES for k, v in got.items()
+            isinstance(k, str) and isinstance(v, str) and v.upper() in _LEVEL_NAMES
+            for k, v in got.items()
         ):
             raise SnapshotRejected(
                 f"`{name}` maps ids to a level in {sorted(_LEVEL_NAMES)}"
             )
+        normalised[name] = {k: v.upper() for k, v in got.items()}
+    snapshot = replace(snapshot, **normalised)
 
     if not isinstance(snapshot.version, int) or isinstance(snapshot.version, bool):
         raise SnapshotRejected("`version` must be an integer")
@@ -244,6 +252,33 @@ def snapshot_from_payload(payload: object) -> ReputationSnapshot:
         raise SnapshotRejected(
             "checksum does not match the reputation maps in this payload"
         )
+
+    # The checksum covers the suspicion maps, not the level maps beside them —
+    # and the levels are what a consumer renders and alerts on. Integrity only
+    # transfers from one to the other if the levels are what the suspicions
+    # were derived FROM (LEVEL_SUSPICION), so that is checked here: a payload
+    # that relabels a FLAGGED resource CLEAN while its checksummed suspicion
+    # still says 1.0 is a rewrite, and is refused like one. A legacy snapshot
+    # carrying no levels at all has nothing to contradict and passes.
+    for levels_name, values_name in (("resource_level", "resource_reputation"),
+                                     ("container_level", "container_reputation")):
+        levels = getattr(snapshot, levels_name)
+        values = getattr(snapshot, values_name)
+        if not levels:
+            continue
+        for key, level in levels.items():
+            expected = LEVEL_SUSPICION[ReputationLevel[level]]
+            if float(values.get(key, 0.0)) != expected:
+                raise SnapshotRejected(
+                    f"`{levels_name}[{key}]` = {level} contradicts "
+                    f"`{values_name}[{key}]` = {values.get(key, 0.0)} "
+                    f"(a {level} resource carries {expected})"
+                )
+        for key in values:
+            if key not in levels:
+                raise SnapshotRejected(
+                    f"`{values_name}[{key}]` has no level in `{levels_name}`"
+                )
     return snapshot
 
 

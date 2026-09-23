@@ -147,3 +147,43 @@ def test_an_unsigned_snapshot_is_accepted() -> None:
     plane does not hold and must not. Requiring one here would mean handing the
     reputation key to the party the reputation is reported TO."""
     assert snapshot_from_payload(snapshot_payload(_snapshot())).signature == ""
+
+
+# ── levels are bound to the checksummed suspicions ────────────────────────────
+
+
+def test_relabelling_a_flagged_resource_clean_is_refused() -> None:
+    """The checksum covers the suspicion maps, and a consumer renders and alerts
+    on the LEVELS. A payload that keeps `1.0` (so the checksum still matches)
+    but says CLEAN would clear a flagged resource on every screen and silence
+    its alert; the level must be the one its suspicion was derived from."""
+    payload = snapshot_payload(_snapshot())
+    payload["resource_level"]["db:customers"] = "CLEAN"
+    with pytest.raises(SnapshotRejected, match="contradicts"):
+        snapshot_from_payload(payload)
+
+
+def test_a_suspicion_with_no_level_is_refused() -> None:
+    payload = snapshot_payload(_snapshot())
+    del payload["resource_level"]["s3:exports"]
+    with pytest.raises(SnapshotRejected, match="has no level"):
+        snapshot_from_payload(payload)
+
+
+def test_a_snapshot_without_levels_still_arrives() -> None:
+    """A legacy snapshot that carries only suspicions has no level to contradict."""
+    legacy = _snapshot(resource_level={}, container_level={})
+    assert snapshot_from_payload(snapshot_payload(legacy)).resource_level == {}
+
+
+def test_lowercase_levels_arrive_canonical() -> None:
+    """Sentinel <0.4.2 wrote `flagged`; the wire refused it, so no real cycle's
+    snapshot could be reported. Either spelling is accepted and handed back in
+    the canonical one, which is what consumers compare against."""
+    payload = snapshot_payload(_snapshot(
+        resource_level={"db:customers": "flagged", "s3:exports": "watch"},
+        container_level={"svc:billing": "Watch"},
+    ))
+    arrived = snapshot_from_payload(payload)
+    assert arrived.resource_level == {"db:customers": "FLAGGED", "s3:exports": "WATCH"}
+    assert arrived.container_level == {"svc:billing": "WATCH"}

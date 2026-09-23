@@ -516,3 +516,33 @@ def test_run_once_dedupes_duplicate_session(tmp_path: Path) -> None:
     # origin = source_class or agent_id = "a"; the dampening counter for (r1, a)
     # must increment once — without dedup the duplicate would push it to 2.
     assert cycle._prior_counts[("r1", "a")] == 1
+
+
+# ── publishing the snapshot to a reporter ─────────────────────────────────────
+
+class TestPublish:
+    def test_publish_receives_the_wire_payload_after_the_swap(self, tmp_path: Path) -> None:
+        from axor_sentinel.sentinel.snapshot import load_snapshot, snapshot_from_payload
+
+        seen: list[dict] = []
+
+        def publish(payload: dict) -> None:
+            # visible on disk BEFORE it is reported: the local enricher is the
+            # consumer that enforces, the plane only renders
+            on_disk = load_snapshot(tmp_path)
+            assert on_disk is not None and on_disk.version == payload["version"]
+            seen.append(payload)
+
+        cycle = SentinelCycle(_MockNeo4j(), tmp_path, agent_baselines={}, publish=publish)
+        snap = cycle.run_once([_session("agent1", [("r1", "c1", 1.0, SignalType.READ)])])
+
+        assert len(seen) == 1
+        assert snapshot_from_payload(seen[0]) == snap
+
+    def test_a_failing_publisher_does_not_fail_the_cycle(self, tmp_path: Path) -> None:
+        def publish(payload: dict) -> None:
+            raise ConnectionError("plane is down")
+
+        cycle = SentinelCycle(_MockNeo4j(), tmp_path, agent_baselines={}, publish=publish)
+        snap = cycle.run_once([_session("agent1", [("r1", "c1", 1.0, SignalType.READ)])])
+        assert snap.version == 1

@@ -507,7 +507,7 @@ class TestFullCycleSnapshot:
         # ...and the decidable verdicts diverge: a denied export FLAGS (P1),
         # a tainted plain READ stays CLEAN (absent from the wire map).
         assert snap_fail.resource_reputation["rr"] == pytest.approx(1.0)
-        assert snap_fail.resource_level["rr"] == "flagged"
+        assert snap_fail.resource_level["rr"] == "FLAGGED"
         assert "rr" not in snap_read.resource_reputation
 
     def test_container_scores_populated(self, session, tmp_path) -> None:
