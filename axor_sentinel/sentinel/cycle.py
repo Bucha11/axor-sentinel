@@ -17,8 +17,9 @@ from axor_sentinel.graph import queries as q
 from axor_sentinel.graph.model import SignalType
 from axor_sentinel.sentinel.attestation import (
     AttestationRecord,
-    active_prior_heat,
+    active_attestation,
     effective_score,
+    is_superseded,
     validate,
 )
 from axor_sentinel.sentinel.events import (
@@ -154,7 +155,10 @@ class SentinelCycle:
         # Operator attestations, keyed by the resource whose branch they cover
         # (UI spec 8.1.1). Append-only: an attestation lowers the score the
         # snapshot exports via a downward recompute, it never mutates Neo4j —
-        # the graph stays the untouched evidence, laundering-proof.
+        # the graph stays the untouched evidence, laundering-proof. Persisted
+        # in the signed state file (save_state) and restored below: held only
+        # in memory, a restart silently dropped every attestation and the
+        # exported level jumped back up.
         self._attestations: dict[str, list[AttestationRecord]] = {}
         # Serialise cycles: run_once mutates _signal_history / _prior_counts /
         # _baselines / _current_version, none of which is safe under overlap.
@@ -179,9 +183,13 @@ class SentinelCycle:
             self._current_version: int = 0
             self._evidence = EvidenceStore()
         else:
-            sh, pc, bl, ver, ev = SentinelCycle.load_state(
+            # One authenticated read feeds both parsers, so the counters and
+            # the attestations always come from the same (verified) file.
+            raw = SentinelCycle._read_state_payload(
                 self._snapshot_dir / "sentinel_state.json"
             )
+            sh, pc, bl, ver, ev = SentinelCycle._parse_state(raw)
+            self._attestations = SentinelCycle._parse_attestations(raw)
             self._baselines = bl
             self._signal_history = sh
             self._prior_counts = pc
@@ -235,11 +243,29 @@ class SentinelCycle:
     # ── Operator attestations (UI spec 8.1.1) ──────────────────────────────────
 
     def attest(self, record: AttestationRecord) -> None:
-        """Append an operator attestation over a resource branch. Reason and
-        operator are required (decision 8); nothing is deleted — the score the
-        snapshot exports descends via effective_score, the graph is untouched.
-        Revocation is a new record whose ``revokes`` names the prior one."""
+        """Append an operator attestation over a resource branch. Reason,
+        operator and resource_id are required (decision 8); nothing is deleted
+        — the score the snapshot exports descends via effective_score, the
+        graph is untouched. Revocation is a new record whose ``revokes`` names
+        the prior one.
+
+        ``created_at`` is stamped from this cycle's clock — it is what newer
+        evidence is compared against (attestation.is_superseded). A caller
+        value is kept only when it is set and not in the future: back-dating
+        can only make the attestation lapse sooner, but a future timestamp
+        would make every later fact look "older" and pin the discount on for
+        good — the "trust this forever" the design refuses.
+
+        The operator/org identity is taken as given; authenticating it is the
+        caller's job (see attestation module docstring). The record is
+        persisted with the rest of the state on the next save (run_once saves
+        every cycle; call save_state() to persist immediately).
+        """
         validate(record)
+        now = time.time()
+        stamp = record.created_at
+        if not (math.isfinite(stamp) and 0.0 < stamp <= now):
+            record = dataclasses.replace(record, created_at=now)
         with self._lock:
             self._attestations.setdefault(record.resource_id, []).insert(0, record)
 
@@ -480,14 +506,39 @@ class SentinelCycle:
         # the graph, never computed in Python) into one consistent snapshot.
         final_scores = q.read_resource_scores(self._neo4j)
 
+        # Windowed evidence is final for this cycle once the sessions above
+        # have been folded in; prune it now so attestation supersession (just
+        # below) and the verdict layer read the SAME fact set.
+        self._evidence.prune(now, self._policy.window_days)
+
+        # Which attestation applies per resource this cycle: the newest active
+        # (unrevoked) one, unless evidence newer than it has arrived — then it
+        # is superseded and discounts nothing (attestation.is_superseded).
+        applied_attestations: dict[str, AttestationRecord] = {}
+        superseded_attestations: dict[str, AttestationRecord] = {}
+        for rid, records in self._attestations.items():
+            active = active_attestation(records)
+            if active is None:
+                continue
+            if is_superseded(
+                active, (e.observed_at for e in self._evidence.evidence_for(rid))
+            ):
+                superseded_attestations[rid] = active
+            else:
+                applied_attestations[rid] = active
+
         # Apply operator attestations as a downward recompute over the read-back
         # scores (UI spec 8.1.1): an attested branch reads its post-attestation
-        # residue, so a re-triggering value heats it right back up from that
-        # baseline. Neo4j is untouched — the evidence stays, only the exported
+        # residue. Neo4j is untouched — the evidence stays, only the exported
         # reputation descends. Container scores below fold this in for free.
-        if self._attestations:
+        # A superseded attestation leaves the raw score standing, same as the
+        # level path below.
+        if applied_attestations:
             final_scores = {
-                rid: effective_score(score, self._attestations.get(rid, []))
+                rid: (
+                    effective_score(score, [applied_attestations[rid]])
+                    if rid in applied_attestations else score
+                )
                 for rid, score in final_scores.items()
             }
 
@@ -501,7 +552,7 @@ class SentinelCycle:
         # levels + facts, published alongside the scalar maps. The scalar path
         # above stays authoritative for the wire values in this phase; the
         # levels are the predicate verdicts being validated against it.
-        self._evidence.prune(now, self._policy.window_days)
+        # (Evidence was pruned above, before the attestation step.)
         resource_verdicts: dict[str, Verdict] = {
             rid: evaluate_resource(self._evidence.evidence_for(rid), self._policy, now)
             for rid in self._evidence.resource_ids()
@@ -535,21 +586,35 @@ class SentinelCycle:
 
         # Operator attestations in the level codomain (UI spec 8.1.1): an
         # active (unrevoked) attestation descends the EXPORTED verdict one
-        # level. History stays — the attestation id lands in the facts, and
-        # the evidence windows and Neo4j are untouched — and every cycle
-        # re-derives levels from evidence before descending, so a
-        # re-triggering branch climbs right back: "I checked, resume
-        # watching", never "trust this forever". The scalar effective_score
-        # above already applied the same event to the telemetry map.
-        for rid, records in self._attestations.items():
-            if active_prior_heat(records) is None:
-                continue
+        # level — but only while no evidence newer than the attestation exists
+        # for the resource. It vouches for what the operator saw, not for
+        # whatever comes next: re-descending on every cycle turned one
+        # attestation into a permanent one-level discount, so a fresh
+        # export-denied FLAGGED read WATCH (0.4, under core's 0.3 floor) and
+        # never re-flagged. With newer evidence the full verdict is exported
+        # and the superseded attestation is named in the facts — history stays
+        # either way (append-only; evidence windows and Neo4j are untouched):
+        # "I checked, resume watching", never "trust this forever". The
+        # fact names the APPLIED attestation, not records[0], which may be a
+        # revocation record. The scalar effective_score above applied the
+        # same decision to the telemetry map.
+        for rid, active in applied_attestations.items():
             attested = resource_verdicts.get(rid)
             if attested is None or attested.level == ReputationLevel.CLEAN:
                 continue
             resource_verdicts[rid] = Verdict(
                 ReputationLevel(attested.level - 1),
-                attested.facts + (f"A2:attested:{records[0].attestation_id}",),
+                attested.facts + (f"A2:attested:{active.attestation_id}",),
+            )
+        for rid, active in superseded_attestations.items():
+            v = resource_verdicts.get(rid)
+            if v is None or v.level == ReputationLevel.CLEAN:
+                continue
+            resource_verdicts[rid] = Verdict(
+                v.level,
+                v.facts + (
+                    f"A2:attestation_superseded_by_newer_evidence:{active.attestation_id}",
+                ),
             )
         resource_levels = {rid: v.level for rid, v in resource_verdicts.items()}
 
@@ -718,6 +783,15 @@ class SentinelCycle:
                 # Deterministic verdict layer: windowed evidence sets survive
                 # restarts inside the same signed envelope.
                 "evidence": self._evidence.to_json(),
+                # Operator attestations (full history, newest first per
+                # resource) ride in the same signed envelope: a forged or
+                # injected attestation would lower exported reputation, so it
+                # needs exactly the integrity the counters get. Never pruned —
+                # history stays.
+                "attestations": {
+                    rid: [r.to_json() for r in records]
+                    for rid, records in self._attestations.items()
+                },
             }
             state_file = self._snapshot_dir / "sentinel_state.json"
             serialized = json.dumps(state, sort_keys=True, separators=(",", ":"))
@@ -756,15 +830,33 @@ class SentinelCycle:
 
         Returns ``(signal_history, prior_counts, baselines, version, evidence)``.
         Returns empty dicts and version=0 if the file does not exist or is corrupt.
+        Attestations live in the same file; read them with load_attestations
+        (kept out of this tuple so existing unpacking callers keep working).
         """
+        return SentinelCycle._parse_state(SentinelCycle._read_state_payload(state_path))
+
+    @staticmethod
+    def load_attestations(state_path: Path) -> dict[str, list[AttestationRecord]]:
+        """Persisted operator attestations from ``state_path``, keyed by
+        resource_id, newest first. Same authentication as load_state; a
+        missing, corrupt, unauthenticated or pre-attestation state file yields
+        ``{}``."""
+        return SentinelCycle._parse_attestations(
+            SentinelCycle._read_state_payload(state_path)
+        )
+
+    @staticmethod
+    def _read_state_payload(state_path: Path) -> dict | None:
+        """Read and authenticate the state file; the decoded dict, or None for
+        a missing / corrupt / unauthenticated file (cold start)."""
         if not state_path.exists():
-            return {}, {}, {}, 0, EvidenceStore()
+            return None
         try:
             text = state_path.read_text(encoding="utf-8")
             obj = json.loads(text)
         except Exception as exc:
             log.warning("sentinel: failed to load state from %s: %s", state_path, exc)
-            return {}, {}, {}, 0, EvidenceStore()
+            return None
 
         # Authenticate before trusting. Signed envelope → verify HMAC; legacy
         # flat state → accept only when no key/signature is required (else cold
@@ -774,18 +866,33 @@ class SentinelCycle:
             serialized = obj.get("payload", "")
             if not verify_blob(serialized, obj.get("sig")):
                 log.warning("sentinel: state signature invalid — cold start")
-                return {}, {}, {}, 0, EvidenceStore()
+                return None
             try:
                 raw = json.loads(serialized)
             except Exception:
-                return {}, {}, {}, 0, EvidenceStore()
+                return None
         else:
             if not verify_blob(text, None):
                 log.warning(
                     "sentinel: unsigned state rejected (key/signature required) — cold start"
                 )
-                return {}, {}, {}, 0, EvidenceStore()
+                return None
             raw = obj
+        return raw if isinstance(raw, dict) else None
+
+    @staticmethod
+    def _parse_state(
+        raw: dict | None,
+    ) -> tuple[
+        dict[str, list[str]],
+        dict[tuple[str, str], int],
+        dict[str, AgentContainerBaseline],
+        int,
+        EvidenceStore,
+    ]:
+        """Counters/baselines/version/evidence from an authenticated payload."""
+        if raw is None:
+            return {}, {}, {}, 0, EvidenceStore()
 
         signal_history: dict[str, list[str]] = raw.get("signal_history", {})
 
@@ -804,6 +911,36 @@ class SentinelCycle:
         version = int(raw.get("version", 0))
         evidence = EvidenceStore.from_json(raw.get("evidence", {}))
         return signal_history, prior_counts, baselines, version, evidence
+
+    @staticmethod
+    def _parse_attestations(raw: dict | None) -> dict[str, list[AttestationRecord]]:
+        """Attestations from an authenticated payload. State written before
+        attestations were persisted has no key → ``{}`` (backward compatible).
+        Each record is re-run through validate(): one that no longer passes
+        (e.g. an older, laxer writer) is skipped and logged rather than
+        failing the whole restore — the rest of the history still applies.
+        Order is preserved (newest first, as attest() keeps it)."""
+        if raw is None:
+            return {}
+        stored = raw.get("attestations", {})
+        if not isinstance(stored, dict):
+            return {}
+        out: dict[str, list[AttestationRecord]] = {}
+        for rid, items in stored.items():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                try:
+                    record = AttestationRecord.from_json(item)
+                    validate(record)
+                except Exception as exc:  # noqa: BLE001 — skip one bad record
+                    log.warning(
+                        "sentinel: skipping unreadable persisted attestation "
+                        "for %s: %s", rid, exc,
+                    )
+                    continue
+                out.setdefault(record.resource_id, []).append(record)
+        return out
 
     def update_baseline(
         self,
