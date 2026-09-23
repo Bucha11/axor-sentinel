@@ -546,3 +546,178 @@ class TestPublish:
         cycle = SentinelCycle(_MockNeo4j(), tmp_path, agent_baselines={}, publish=publish)
         snap = cycle.run_once([_session("agent1", [("r1", "c1", 1.0, SignalType.READ)])])
         assert snap.version == 1
+
+
+# ── Versions never go backwards, even when the state file does ────────────────
+
+def _restart(tmp_path: Path) -> SentinelCycle:
+    """A fresh process: no explicit state, so it restores from disk."""
+    return SentinelCycle(_MockNeo4j(), tmp_path)
+
+
+class TestVersionMonotonicity:
+    def _five_cycles(self, tmp_path: Path) -> None:
+        cycle = _restart(tmp_path)
+        for _ in range(5):
+            cycle.run_once([])
+        assert cycle._current_version == 5
+
+    @pytest.mark.parametrize("damage", ["truncate", "delete", "garbage"])
+    def test_lost_state_resumes_above_the_snapshots(self, tmp_path: Path, damage) -> None:
+        """5 cycles, then the state file is lost; the next cycle must be v6.
+        It used to restart at v1 and rewrite the retained snapshot_v3..v5 with
+        different content under the same numbers."""
+        self._five_cycles(tmp_path)
+        retained = {
+            f.name: f.read_bytes() for f in tmp_path.glob("snapshot_v*.json")
+        }
+        state = tmp_path / "sentinel_state.json"
+        if damage == "truncate":
+            state.write_bytes(state.read_bytes()[:17])
+        elif damage == "delete":
+            state.unlink()
+        else:
+            state.write_text("{broken", encoding="utf-8")
+
+        cycle = _restart(tmp_path)
+        assert cycle._current_version == 5
+        snap = cycle.run_once([])
+        assert snap.version == 6
+        assert (tmp_path / "snapshot_current").resolve().name == "snapshot_v6.json"
+        # no retained version was rewritten
+        for name, content in retained.items():
+            path = tmp_path / name
+            if path.exists():
+                assert path.read_bytes() == content, name
+
+    def test_state_behind_the_snapshots_resumes_above_them(self, tmp_path: Path) -> None:
+        """A save that failed leaves an intact but OLDER state file."""
+        self._five_cycles(tmp_path)
+        cycle = _restart(tmp_path)
+        cycle._current_version = 2
+        cycle.save_state()
+        assert _restart(tmp_path)._current_version == 5
+
+    def test_rejected_signed_state_resumes_above_the_snapshots(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """A state file whose signature fails is a cold start for the counters —
+        not for the version sequence."""
+        monkeypatch.setenv("AXOR_SNAPSHOT_KEY", "k1")
+        self._five_cycles(tmp_path)
+        monkeypatch.setenv("AXOR_SNAPSHOT_KEY", "k2")  # key rotated: state rejected
+        assert _restart(tmp_path)._current_version == 5
+
+    def test_explicit_state_on_a_used_dir_resumes_above_it(self, tmp_path: Path) -> None:
+        self._five_cycles(tmp_path)
+        cycle, _ = _cycle(tmp_path)                 # explicit (seeded) state
+        assert cycle.run_once([]).version == 6
+
+    def test_state_write_is_atomic(self, tmp_path: Path, monkeypatch) -> None:
+        """A crash inside the save leaves the previous state intact, never a
+        truncated file."""
+        import axor_sentinel.sentinel.snapshot as snap_mod
+
+        cycle, _ = _cycle(tmp_path)
+        cycle._current_version = 7
+        cycle.save_state()
+
+        def _crash(src, dst):
+            raise OSError("power cut")
+
+        monkeypatch.setattr(snap_mod.os, "replace", _crash)
+        cycle._current_version = 8
+        cycle.save_state()   # logged, swallowed
+        monkeypatch.undo()
+
+        _, _, _, ver, _ = SentinelCycle.load_state(tmp_path / "sentinel_state.json")
+        assert ver == 7
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_failed_save_is_logged_at_error(self, tmp_path: Path, monkeypatch, caplog) -> None:
+        import logging
+
+        import axor_sentinel.sentinel.cycle as cyc
+
+        def _boom(*a, **kw):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(cyc, "write_file_atomic", _boom)
+        cycle, _ = _cycle(tmp_path)
+        with caplog.at_level(logging.ERROR, logger="axor.sentinel.cycle"):
+            snap = cycle.run_once([])
+        # the cycle still publishes; the version is recoverable from the dir
+        assert snap.version == 1
+        assert any(
+            r.levelno == logging.ERROR and "failed to save state" in r.getMessage()
+            for r in caplog.records
+        )
+        monkeypatch.undo()
+        assert _restart(tmp_path)._current_version == 1
+
+
+# ── Locking: save_state / update_baseline vs each other and run_once ─────────
+
+class TestStateLocking:
+    def test_save_state_waits_for_the_lock(self, tmp_path: Path) -> None:
+        import threading
+
+        cycle, _ = _cycle(tmp_path)
+        cycle._lock.acquire()
+        t = threading.Thread(target=cycle.save_state)
+        t.start()
+        t.join(timeout=0.2)
+        assert t.is_alive(), "save_state ran without the cycle lock"
+        cycle._lock.release()
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+    def test_update_baseline_waits_for_the_lock(self, tmp_path: Path) -> None:
+        import threading
+
+        cycle, _ = _cycle(tmp_path)
+        sessions = [
+            _session("a", [("r1", "c1", 1.0, SignalType.READ)]),
+            _session("a", [("r2", "c2", 1.0, SignalType.READ)]),
+        ]
+        cycle._lock.acquire()
+        t = threading.Thread(target=cycle.update_baseline, args=("a", sessions))
+        t.start()
+        t.join(timeout=0.2)
+        assert "a" not in cycle._baselines
+        cycle._lock.release()
+        t.join(timeout=5)
+        assert "a" in cycle._baselines
+
+    def test_concurrent_baseline_updates_do_not_break_saves(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """Reproduction: update_baseline inserting into _baselines while
+        save_state iterated it failed most saves with 'dictionary changed size
+        during iteration' — silently, at warning level."""
+        import logging
+        import threading
+
+        cycle, _ = _cycle(tmp_path)
+        sessions = [
+            _session("x", [("r1", "c1", 1.0, SignalType.READ)]),
+            _session("x", [("r2", "c2", 1.0, SignalType.READ)]),
+        ]
+        stop = threading.Event()
+
+        def _churn() -> None:
+            i = 0
+            while not stop.is_set():
+                cycle.update_baseline(f"agent{i}", sessions)
+                i += 1
+
+        worker = threading.Thread(target=_churn)
+        with caplog.at_level(logging.WARNING, logger="axor.sentinel.cycle"):
+            worker.start()
+            try:
+                for _ in range(200):
+                    cycle.save_state()
+            finally:
+                stop.set()
+                worker.join(timeout=5)
+        assert not [r for r in caplog.records if "failed to save state" in r.getMessage()]

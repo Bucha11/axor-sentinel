@@ -39,10 +39,12 @@ from axor_sentinel.sentinel.predicates import (
 from axor_sentinel.sentinel.snapshot import (
     ReputationSnapshot,
     atomic_swap,
+    latest_snapshot_version,
     sign_blob,
     snapshot_payload,
     validate_snapshot_dir,
     verify_blob,
+    write_file_atomic,
 )
 from axor_sentinel.sentinel.weight import (
     FLAG_THRESHOLD,
@@ -156,6 +158,12 @@ class SentinelCycle:
         self._attestations: dict[str, list[AttestationRecord]] = {}
         # Serialise cycles: run_once mutates _signal_history / _prior_counts /
         # _baselines / _current_version, none of which is safe under overlap.
+        # Every other reader/writer of that state (save_state, update_baseline)
+        # takes it too — save_state iterates the dicts while serialising, and a
+        # concurrent insert raised "dictionary changed size during iteration",
+        # which the old blanket except turned into a silently missing save.
+        # A plain Lock, not an RLock: run_once already holds it when it saves,
+        # so it calls _save_state_locked directly instead of re-entering.
         self._lock = threading.Lock()
 
         # If explicit state is provided (tests / controlled init), use it directly.
@@ -181,6 +189,25 @@ class SentinelCycle:
             self._evidence = ev
             if ver > 0:
                 log.info("sentinel: restored persisted state version=%d", ver)
+
+        # Versions never go backwards, even when the state file does. The state
+        # can be missing, truncated by a crash (pre-atomic writes), rejected by
+        # its signature check, or simply older than the snapshots (a failed
+        # save) — every one of those used to restart the sequence at 0, and the
+        # next cycle then rewrote the retained snapshot_v1..vN with DIFFERENT
+        # content under the same numbers. The snapshot directory itself is the
+        # other witness to how far the sequence got, so resume above both. This
+        # applies to explicitly-seeded state too: a fresh counter pointed at a
+        # used directory would otherwise be refused by atomic_swap's regression
+        # guard on its first write.
+        on_disk = latest_snapshot_version(self._snapshot_dir)
+        if on_disk > self._current_version:
+            log.warning(
+                "sentinel: state version %d is behind the snapshot directory "
+                "(version %d on disk) — resuming above it so no version is reused",
+                self._current_version, on_disk,
+            )
+            self._current_version = on_disk
 
         # Warn early if snapshot_dir is a network mount (invariant A-17).
         # Done in __init__ so operators learn about the misconfiguration at startup,
@@ -574,7 +601,16 @@ class SentinelCycle:
         # snapshot — the next run derives a fresh higher version — rather than behind
         # it, which would re-emit THIS version with different content (a consumer
         # would see two distinct snapshots at the same version).
-        self.save_state()
+        #
+        # If the save FAILS (logged at error level, not raised) the cycle still
+        # publishes. That is safe for the version sequence: the old state file is
+        # intact (writes are atomic) but behind, and on restart __init__ resumes
+        # at max(state version, latest_snapshot_version(dir)) — the snapshot
+        # written below is itself the witness, so no version is ever reused.
+        # What a failed save costs is only the counters/evidence gathered since
+        # the last good save, which is the cold-start trade the design already
+        # accepts; withholding the snapshot would cost the node its reputation.
+        self._save_state_locked()
         atomic_swap(self._snapshot_dir, snapshot)
         self._publish_snapshot(snapshot)
 
@@ -645,8 +681,25 @@ class SentinelCycle:
         at the end of every ``run_once()`` so poisoning-mitigation counters and
         agent baselines survive process restarts.
 
-        Failures are logged and swallowed — a missing state file is recoverable
-        (cold-start behaviour); a crash during save must not abort the cycle.
+        Thread-safe: takes the cycle lock, so it cannot serialise the dicts while
+        run_once or update_baseline is mutating them. Must not be called from
+        inside run_once (the lock is not re-entrant) — that path uses
+        _save_state_locked.
+
+        Failures are logged at ERROR and swallowed — a missing state file is
+        recoverable (cold-start behaviour, and the version is recovered from the
+        snapshot directory); a crash during save must not abort the cycle.
+        """
+        with self._lock:
+            self._save_state_locked()
+
+    def _save_state_locked(self) -> None:
+        """save_state body; the caller holds ``self._lock``.
+
+        The file is replaced atomically (write_file_atomic: temp + fsync +
+        os.replace), so a crash mid-save leaves the previous state intact
+        instead of a truncated file that the next start would read as a cold
+        start at version 0.
         """
         try:
             self._snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -679,10 +732,14 @@ class SentinelCycle:
                 )
             else:
                 out = serialized
-            state_file.write_text(out, encoding="utf-8")
+            write_file_atomic(state_file, out)
             log.debug("sentinel state saved: version=%d", self._current_version)
-        except Exception as exc:  # pragma: no cover
-            log.warning("sentinel: failed to save state: %s", exc)
+        except Exception:  # noqa: BLE001 — see save_state / run_once
+            log.error(
+                "sentinel: failed to save state (version=%d); counters since the "
+                "last good save will be lost on restart",
+                self._current_version, exc_info=True,
+            )
 
     @staticmethod
     def load_state(
@@ -758,6 +815,10 @@ class SentinelCycle:
 
         Called after each completed session. Exponential smoothing prevents a single
         anomalous session from sharply shifting the baseline.
+
+        Takes the cycle lock: callers run this from session-completion hooks on
+        other threads, concurrently with run_once / save_state iterating
+        ``_baselines``.
         """
         if len(recent_sessions) < 2:
             return
@@ -773,17 +834,20 @@ class SentinelCycle:
         variance = sum((c - mean) ** 2 for c in counts) / max(n - 1, 1)
         std = math.sqrt(variance) if variance > 0 else 0.0
 
-        existing = self._baselines.get(agent_id)
-        if existing is not None:
-            # Exponential smoothing: blend new stats with existing baseline
-            alpha = 0.3
-            mean = alpha * mean + (1 - alpha) * existing.mean_containers_per_session
-            std = alpha * std + (1 - alpha) * existing.std_containers_per_session
+        # Read-modify-write of the existing baseline under the lock, so two
+        # concurrent updates for one agent cannot lose one's smoothing step.
+        with self._lock:
+            existing = self._baselines.get(agent_id)
+            if existing is not None:
+                # Exponential smoothing: blend new stats with existing baseline
+                alpha = 0.3
+                mean = alpha * mean + (1 - alpha) * existing.mean_containers_per_session
+                std = alpha * std + (1 - alpha) * existing.std_containers_per_session
 
-        self._baselines[agent_id] = AgentContainerBaseline(
-            agent_id=agent_id,
-            mean_containers_per_session=mean,
-            std_containers_per_session=std,
-            session_count=n,
-            last_updated=time.time(),
-        )
+            self._baselines[agent_id] = AgentContainerBaseline(
+                agent_id=agent_id,
+                mean_containers_per_session=mean,
+                std_containers_per_session=std,
+                session_count=n,
+                last_updated=time.time(),
+            )

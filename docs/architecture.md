@@ -341,7 +341,11 @@ class ReputationSnapshot:
     generated_at: float
     resource_reputation: dict[str, float]   # resource_id → score
     container_reputation: dict[str, float]  # container_id → score
-    checksum: str                           # SHA-256 of JSON body
+    checksum: str                           # SHA-256 of the two reputation maps
+                                            # (unkeyed: corruption detection only)
+    signature: str                          # HMAC-SHA256 (AXOR_SNAPSHOT_KEY) over the
+                                            # whole snapshot minus checksum/signature
+    # + resource_level / container_level / verdict_facts / *_score_telemetry
 ```
 
 ### Atomic write (A-5, A-16)
@@ -350,24 +354,37 @@ Integrity guarantee: no reader ever sees a partial write.
 
 ```
 POSIX:
+  0. refuse N <= live version (SnapshotVersionRegression)
   1. serialize → bytes
-  2. write to snapshot_v{N}.json (temp)
+  2. write temp + fsync + os.replace → snapshot_v{N}.json (never in place)
   3. verify checksum of in-memory bytes (never re-reads from disk — A-5)
-  4. os.symlink(new_file, snapshot_new)
-  5. os.rename(snapshot_new, snapshot_current)    ← atomic on POSIX
+  4. os.symlink(new_file, snapshot_link_v{N})
+  5. os.rename(snapshot_link_v{N}, snapshot_current)  ← atomic on POSIX; fsync dir
+  6. prune old versions, stale snapshot_link_v* and temp files
 
 Windows:
-  1–3. same
+  0–3. same
   4. os.replace(new_file, snapshot_current)       ← atomic on Windows
 ```
+
+Versions never go backwards: on start the cycle resumes at
+max(sentinel_state.json version, highest snapshot_v*.json, live link version), so
+a lost or truncated state file cannot make it reuse a retained version number.
+`sentinel_state.json` is itself written atomically (temp + fsync + os.replace).
 
 ### Load + checksum verification
 
 ```python
 snapshot = load_snapshot(snapshot_dir)
-# Returns None (with AuditIntegrityWarning) on checksum mismatch
+# Returns None (with AuditIntegrityWarning) on checksum / signature mismatch,
+# a malformed file, or levels that contradict the suspicion maps
 # Never raises — fail-safe for hot path
 ```
+
+`load_snapshot` has no memory, so it cannot detect a rollback (an older, validly
+signed `snapshot_v{N}.json` re-linked as current). `SnapshotIntentEnricher.reload`
+is the stateful reader: it keeps its held snapshot when the load fails and refuses
+a version lower than the one it holds.
 
 ### Network mount warning (A-17)
 

@@ -81,8 +81,41 @@ class SnapshotIntentEnricher:
         return cls(snapshot)
 
     def reload(self, snapshot_dir: Path) -> None:
-        """Reload the snapshot from disk. Call after each audit cycle."""
-        self._snapshot = load_snapshot(Path(snapshot_dir))
+        """Reload the snapshot from disk. Call after each audit cycle.
+
+        The held snapshot is only ever REPLACED by a newer one:
+
+        - load fails (checksum / signature / parse / level-binding failure, a
+          missing or dangling link) → keep the previous snapshot and warn.
+          load_snapshot returns None for all of these, and assigning that None
+          switched reputation off for the whole node until the next good cycle —
+          a corrupted or tampered file is exactly when it must stay on.
+        - loaded version < held version → a ROLLBACK (e.g. snapshot_current
+          re-linked to an older, validly-signed snapshot_vN.json); keep the
+          previous snapshot and warn. load_snapshot has no memory and cannot see
+          this — this is the stateful reader, so the check lives here.
+        - loaded version == held version → no-op; the cycle never publishes two
+          snapshots under one version, so there is nothing newer to take.
+        """
+        loaded = load_snapshot(Path(snapshot_dir))
+        held = self._snapshot
+        if loaded is None:
+            if held is not None:
+                log.warning(
+                    "enricher: snapshot reload from %s failed — keeping version %d",
+                    snapshot_dir, held.version,
+                )
+            return
+        if held is not None and loaded.version < held.version:
+            log.warning(
+                "enricher: refusing snapshot version %d from %s — lower than the "
+                "held version %d (rollback); keeping version %d",
+                loaded.version, snapshot_dir, held.version, held.version,
+            )
+            return
+        if held is not None and loaded.version == held.version:
+            return
+        self._snapshot = loaded
 
     def enrich(
         self,
