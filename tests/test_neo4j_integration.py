@@ -544,7 +544,7 @@ class TestFullCycleSnapshot:
 
         assert snap.resource_score_telemetry["r1"] > 0.0
         assert snap.resource_score_telemetry["r1"] == pytest.approx(_score(session, "r1"))
-        assert snap.resource_level["r1"] == "watch"
+        assert snap.resource_level["r1"] == "WATCH"
         assert snap.resource_reputation["r1"] == pytest.approx(0.4)
 
     def test_untainted_session_leaves_score_at_zero(self, session, tmp_path) -> None:
@@ -638,5 +638,5 @@ class TestFullCycleSnapshot:
         # Decidable layer: fanout floors the touched resource at WATCH and
         # names the fact.
         assert snap.resource_reputation["r0"] == pytest.approx(0.4)
-        assert snap.resource_level["r0"] == "watch"
+        assert snap.resource_level["r0"] == "WATCH"
         assert any(f.startswith("F1:fanout") for f in snap.verdict_facts["r0"])
