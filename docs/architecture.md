@@ -67,7 +67,8 @@ It does this by maintaining a **resource reputation graph** in Neo4j and publish
 axor_sentinel/
 ├── graph/
 │   ├── model.py          # Node/edge dataclasses, SignalType enum
-│   ├── normalizer.py     # Resource ID normalization (3-tier)
+│   ├── normalizer.py     # Resource ID normalization (3-tier, lexical — §4b)
+│   ├── derive.py         # tool call → identity (shared by enricher + core_sink)
 │   └── queries.py        # Cypher query strings + runner functions
 ├── sentinel/
 │   ├── events.py         # ReputationEvent, FanoutSignal, AgentContainerBaseline
@@ -163,6 +164,69 @@ The scalar machinery below (§5) is retained as demoted TELEMETRY — the
 `resource_score_telemetry` snapshot fields and the graph's `suspicion_score`
 property; `FLAG_THRESHOLD` labels that telemetry and gates nothing.
 
+## 4b. Resource identity
+
+Cross-session detection needs **one resource ⇒ one id**. An id that varies with
+something the caller controls but that does not change *what* is touched (the tool
+verb, the encoding, `./`) is **evasion** — accesses spread over several nodes and
+none accumulates. An id that drops something distinguishing resources (the URL host,
+the query) is **poisoning** — traffic on one resource raises or launders another.
+
+`graph.derive.derive_identity(tool, args)` is the single function both the hot-path
+enricher and the audit-path `CoreSessionSink` call, so they agree by construction.
+
+| Source | Resource id | Container id | Tier |
+|---|---|---|---|
+| local path (`path` / `file_path` / `file`) | `file:/data/secret.txt` | `file:/data` | path 0.7 |
+| relative local path | `file:rel/x` | `file:rel` | path 0.7 |
+| non-URL path, recognised provider tool | `sharepoint:/sites/hr/x.xlsx` | `sharepoint:/sites/hr` | path 0.7 |
+| http(s) URL (`url` / `uri`) | `url:corp.example.com/a/b?id=1&v=2` | `url:corp.example.com/a` | path 0.7 |
+| other-scheme URL | `url:s3://bucket/key` | `url:s3://bucket/` | path 0.7 |
+| `file://host/...` (remote) | `file://host/share/x` | `file://host/share` | path 0.7 |
+| provider object id, **no path**, recognised provider | `sharepoint:item:42` | itself | provider_id 1.0 |
+| `filename` (+ `size`, `last_modified`) | `heuristic:name\|size\|mtime` (`<provider>:heuristic:…` under a recognised provider) | itself | heuristic 0.4 |
+| nothing of the above (bash, send_email …) | **no access recorded** | — | — |
+
+Rules:
+
+- **The tool verb never reaches the id.** The only thing a tool name contributes is a
+  provider from the `KNOWN_PROVIDERS` allowlist (sharepoint, onedrive, gdrive, gmail,
+  outlook, slack, teams, dropbox, box, confluence, jira, notion, github, gitlab,
+  salesforce), matched on whole name tokens (split on `_`, `__`, `.`, `-`, `/`, `:`,
+  camelCase). `read_file`, `write_file`, `fs_read`, `mcp__fs__read_file` and `Read`
+  on `/data/secret.txt` all yield `file:/data/secret.txt`; `wasp_tool` is not
+  SharePoint. An unrecognised service never invents a namespace.
+- **Path before provider id.** A path/URL the tool opens outranks an `object_id` /
+  `item_id` in the args (which an attacker can add alongside a real path). A provider
+  id is used only without a path, and only namespaced by a recognised provider — a
+  bare `42` would be one node for every tool that numbers its objects.
+- **Lexical only — no disk, network or clock.** Percent-decode once; resolve `.`,
+  `..` (never above `/`) and repeated `/`; strip trailing `/`. Symlinks are *not*
+  resolved (see §10a).
+- **Case.** Only the URL scheme and host are lowercased; paths keep their case
+  (case-sensitive filesystems and URL paths).
+- **URLs** keep the host, a non-default port and the query (sorted, re-encoded; the
+  query is routinely the identity, `?id=1` ≠ `?id=2`). Dropped: fragment, userinfo,
+  default port, and credential params (`token`, `access_token`, `id_token`,
+  `refresh_token`, `api_key`, `apikey`, `sig`, `signature`, `x-amz-*`, `x-goog-*`) —
+  they rotate per request and must not be persisted into the graph or snapshot.
+  `http` and `https` share an id. Local paths keep `#` and `?` (legal filename chars).
+- **Containers derive from the normalised locator**, never the raw arg. A resource
+  with no hierarchy (provider item, fingerprint) is its own container rather than one
+  provider-wide container that would make every item adjacent to every other.
+- **`""` is never an id.** A call that names no resource records no access (enricher
+  and sink); `construct.upsert_graph` and `evidence_from_session` also drop `""`
+  defensively.
+
+**Migration (ids changed after 0.4.2).** Resource and container ids changed format
+(previously e.g. `read:/data/secret.txt`, `fs:/data/secret.txt`, lowercased paths,
+host-less URLs, bare provider ids, `""` for path-less calls). Reputation, evidence
+and `Resource`/`Container` nodes accumulated under the old ids **do not carry over**
+— nothing maps old ids to new ones (the old mapping was many-to-many, which is the
+bug). After upgrading, old snapshot entries and graph nodes simply stop being hit
+and decay/expire on their normal schedule (evidence TTL 30 days); purge them
+explicitly if a clean start is preferred.
+
 ## 5. Weight model
 
 All weight math lives in `sentinel/weight.py` — pure Python, no I/O, fully testable.
@@ -202,8 +266,8 @@ effective_weight = raw_weight
 
 | Method | Confidence |
 |---|---|
-| Provider object ID (SharePoint, OneDrive, …) | 1.0 |
-| Normalized path | 0.7 |
+| Provider object ID (recognised provider, no path — §4b) | 1.0 |
+| Normalized path / URL | 0.7 |
 | Heuristic fingerprint (filename + size + mtime) | 0.4 |
 
 **`source_diversity_factor`** — reduces weight when signals are concentrated from one taint source. Full concentration (100% from one source) → 70% weight reduction:
@@ -414,7 +478,7 @@ enriched = dataclasses.replace(
 **Key constraints:**
 - Never queries Neo4j (A-6) — reads pre-loaded snapshot only
 - Never raises — failures are logged, original intent returned
-- Resource ID derived from intent args via `graph/normalizer.py` (same 3-tier normalization)
+- Resource/container ids derived via `graph.derive.derive_identity` — the same function `CoreSessionSink` uses (§4b); a call naming no resource is left unenriched
 - Converts suspicion → trust polarity at the boundary (`reputation = 1 - suspicion`, clamped above 0)
 
 ### Observe-only coupling (reputation never denies)
@@ -532,7 +596,15 @@ limitations below — a poisoned score cannot cause a wrong deny.
 What is sound by construction: no raw session content crosses the boundary (the
 snapshot is `id → float` only); all Cypher is parameterized; the hot-path enricher is
 Neo4j-free and fail-safe; the snapshot swap is atomic and TOCTOU-safe; and the
-resource-id normalizer resolves symlinks so a resource cannot be aliased/split.
+resource-id normalizer is purely lexical and tool-independent (§4b), so the hot path
+and the audit path compute identical ids.
+
+- **Symlink aliases split identity (residual).** The normalizer no longer
+  `realpath`-resolves: that touched the disk on the hot path, answered differently
+  on the enricher's and the sink's hosts (breaking id parity) and was racy (a link
+  can be repointed between resolution and use). A path reached through a symlink
+  therefore gets its own id. Likewise a relative path is not joined to a cwd, so
+  `file:x` and `file:/work/x` are distinct.
 
 ---
 

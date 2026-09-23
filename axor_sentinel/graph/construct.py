@@ -114,6 +114,10 @@ def upsert_graph(
                 "seed_score": float(resource_scores.get(a.resource_id, 0.0)),
             }
             for a in s.accessed_resources
+            # Defensive: "" is "no resource" (graph.normalizer), never a node. The
+            # producers already skip it; an upstream adapter that does not would
+            # otherwise MERGE one Resource shared by every path-less call.
+            if a.resource_id
         ]
         if accesses:
             session.run(
@@ -139,11 +143,16 @@ def _adjacency_pairs(
 
     Both directions are emitted (permutations, not combinations) so adjacency is
     symmetric; duplicates across overlapping containers are collapsed.
+
+    ``""`` containers and members are skipped: an empty id is "no resource", and a
+    ``""`` container would make every path-less access adjacent to every other.
     """
     seen: set[tuple[str, str]] = set()
     pairs: list[dict[str, str]] = []
-    for members in container_members.values():
-        uniq = list(dict.fromkeys(members))   # dedupe, preserve order
+    for container_id, members in container_members.items():
+        if not container_id:
+            continue
+        uniq = [m for m in dict.fromkeys(members) if m]   # dedupe, preserve order
         for source, target in permutations(uniq, 2):
             key = (source, target)
             if key in seen:

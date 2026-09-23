@@ -50,6 +50,32 @@ Score accumulation uses **logarithmic diminishing returns** — each signal cont
 new_score = current + new_weight × (1 − current)
 ```
 
+## Resource ids
+
+Reputation accumulates per resource id, so one resource must map to exactly one id
+whatever tool touched it. Ids are derived purely lexically (no disk access) by
+`graph.derive.derive_identity`, which both the hot-path enricher and the audit-path
+`CoreSessionSink` call:
+
+| Source | Id |
+|---|---|
+| local path (any tool: `read_file`, `write_file`, `fs_read`, `Read`, …) | `file:/data/secret.txt` |
+| http(s) URL — host kept, query sorted, fragment/credentials dropped | `url:corp.example.com/a/b?id=1` |
+| other-scheme URL | `url:s3://bucket/key` |
+| non-URL path via a recognised provider tool | `sharepoint:/sites/hr/x.xlsx` |
+| provider object id (no path; recognised provider only) | `sharepoint:item:42` |
+| filename fingerprint | `heuristic:name\|size\|mtime` |
+| call naming no resource (`bash`, `send_email`) | no access recorded |
+
+Containers are the parent of the normalised locator (`file:/data`, `url:host/a`).
+Full rules: [architecture.md §4b](docs/architecture.md#4b-resource-identity).
+
+> **Migration.** The id format changed after 0.4.2 (previously verb-prefixed ids such
+> as `read:/data/x` / `fs:/data/x`, lowercased paths, host-less URLs, bare provider
+> ids, `""` for path-less calls). Reputation, evidence and graph nodes accumulated
+> under old ids **do not carry over**; they stop being hit and decay/expire on
+> their normal schedule (or purge them for a clean start).
+
 ## Quick start
 
 ```bash

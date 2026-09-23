@@ -72,7 +72,8 @@ def test_read_only_session_maps_to_read_grade():
     access = summary.accessed_resources[0]
     assert isinstance(access, ResourceAccess)
     assert access.signal_type is SignalType.READ
-    assert access.resource_id  # non-empty derived id
+    assert access.resource_id == "file:/data/report.txt"
+    assert access.container_id == "file:/data"
 
 
 def test_tainted_export_denied_session():
@@ -84,7 +85,7 @@ def test_tainted_export_denied_session():
         taint_sources=("mcp_tool_output", "web_fetch"),
         event_kinds=("intent_approved", "intent_denied", "escalation_granted"),
         tool_invocations=(
-            _FakeInvocation(tool="fs_read", args={"item_id": "abc123"}),
+            _FakeInvocation(tool="sharepoint_read", args={"item_id": "abc123"}),
             _FakeInvocation(
                 tool="email_send",
                 args={"path": "/out/leak.csv"},
@@ -102,8 +103,10 @@ def test_tainted_export_denied_session():
     assert summary.had_escalation is True
     assert summary.taint_source == "mcp_tool_output"
 
-    # provider_id-derived id is the raw object id, confidence 1.0
-    read_access = next(a for a in summary.accessed_resources if a.resource_id == "abc123")
+    # provider_id-derived id is namespaced by the recognised provider, confidence 1.0
+    read_access = next(
+        a for a in summary.accessed_resources if a.resource_id == "sharepoint:item:abc123"
+    )
     assert read_access.signal_type is SignalType.READ
     assert read_access.canonical_confidence == 1.0
     # the failed export grades to the strongest export-ish member
@@ -191,3 +194,32 @@ def test_mapping_error_buffers_minimal_summary_and_does_not_raise():
     assert summary.had_taint is True          # preserved from taint_active
     assert summary.accessed_resources == []   # minimal: nothing derived
     assert summary.taint_source == "unknown_external"
+
+
+def test_pathless_calls_record_no_access():
+    # bash / send_email name no resource. They used to map to resource_id "" — one
+    # node shared by every such call, so flagging it once flagged all of them.
+    sink = CoreSessionSink()
+    record = _FakeRecord(
+        tool_invocations=(
+            _FakeInvocation(tool="bash", args={"command": "ls"}),
+            _FakeInvocation(tool="send_email", args={"to": "a@b.c"}, executed=False),
+            _FakeInvocation(tool="read_file", args={"path": "/data/x.txt"}),
+        ),
+    )
+    _run(sink.on_session_closed(record))
+    summary = sink.drain_pending()[0]
+    assert [a.resource_id for a in summary.accessed_resources] == ["file:/data/x.txt"]
+    # The export is still seen at session level even though it names no resource.
+    assert summary.had_export_attempt is True
+
+
+def test_export_detection_is_token_based():
+    from axor_sentinel.integration.core_sink import _is_export_tool
+
+    # Substring matching marked these plain reads as exports.
+    for tool in ("read_email", "postgres_query", "repost_count_read", "rewriter_lint"):
+        assert not _is_export_tool(tool), tool
+    for tool in ("send_email", "email_send", "slack_post", "fs.write", "sendEmail",
+                 "mcp__drive__upload_file", "git-push", "Export"):
+        assert _is_export_tool(tool), tool

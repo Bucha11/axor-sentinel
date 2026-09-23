@@ -15,9 +15,14 @@ from axor_sentinel.sentinel.snapshot import (
     load_snapshot,
 )
 
-# ── M-1: symlink aliasing collapses to one canonical id ──────────────────────
+# ── M-1 (superseded): resource ids are lexical, symlinks are NOT resolved ─────
+# The M-1 fix realpath-resolved absolute paths. That touched the disk on the hot
+# path, gave the enricher's host and the audit sink's host different ids for the
+# same call (breaking hot/audit parity) and was racy (a link can be repointed).
+# Normalisation is now purely lexical; a symlink alias is a documented residual
+# split (architecture.md §10a), not something a disk lookup can fix reliably.
 
-def test_symlink_and_target_share_canonical_id(tmp_path):
+def test_symlink_not_resolved_lexical_only(tmp_path):
     target = tmp_path / "real.txt"
     target.write_text("x")
     link = tmp_path / "alias.txt"
@@ -25,7 +30,8 @@ def test_symlink_and_target_share_canonical_id(tmp_path):
 
     rid_target, _, _ = normalize_resource_id({"path": str(target)})
     rid_link, _, _ = normalize_resource_id({"path": str(link)})
-    assert rid_target == rid_link
+    assert rid_target == f"file:{target}"
+    assert rid_link == f"file:{link}"
 
 
 def test_relative_path_not_cwd_joined():

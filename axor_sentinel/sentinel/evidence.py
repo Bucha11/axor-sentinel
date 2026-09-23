@@ -142,9 +142,16 @@ def evidence_from_session(
     tainted: bool,
     accesses: Iterable,  # Iterable[cycle.ResourceAccess] — no import cycle
 ) -> list[tuple[str, Evidence]]:
-    """Map one session's accesses to (resource_id, Evidence) pairs."""
+    """Map one session's accesses to (resource_id, Evidence) pairs.
+
+    Accesses with an empty ``resource_id`` are dropped: ``""`` means "no resource"
+    (graph.normalizer), and evidence filed under it would be one verdict shared by
+    every path-less call — flag it once and all of them cross the floor.
+    """
     out: list[tuple[str, Evidence]] = []
     for access in accesses:
+        if not access.resource_id:
+            continue
         out.append((
             access.resource_id,
             Evidence(

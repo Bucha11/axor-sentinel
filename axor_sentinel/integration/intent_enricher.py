@@ -5,8 +5,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from axor_sentinel.graph.derive import derive_container_id, derive_resource_info
-from axor_sentinel.graph.normalizer import normalize_resource_id
+from axor_sentinel.graph.derive import derive_identity
 from axor_sentinel.sentinel.snapshot import ReputationSnapshot, load_snapshot
 
 if TYPE_CHECKING:
@@ -136,7 +135,12 @@ class SnapshotIntentEnricher:
             return normalized
 
         try:
-            resource_id, container_id = self._derive_ids(intent)
+            ids = self._derive_ids(intent)
+            if ids is None:
+                # No resource named (bash, send_email …): nothing to look up. Never
+                # look up "" — that would be one reputation for every such call.
+                return normalized
+            resource_id, container_id = ids
             # The snapshot stores SUSPICION (high = bad); core's reputation field is
             # TRUST (low-positive crosses the floor). Convert at this boundary.
             resource_susp = self._snapshot.resource_reputation.get(resource_id, 0.0)
@@ -154,22 +158,20 @@ class SnapshotIntentEnricher:
             log.debug("enricher failed (returning original): %s", exc)
             return normalized
 
-    def _derive_ids(self, intent: Intent) -> tuple[str, str]:
+    def _derive_ids(self, intent: Intent) -> tuple[str, str] | None:
         """
-        Derive (resource_id, container_id) from intent args.
+        Derive (resource_id, container_id) from intent args, or ``None`` when the
+        call names no resource.
 
-        Resource ID derived via graph/normalizer.py priority order.
-        Container ID derived from service + directory extracted from args.
+        Uses ``graph.derive.derive_identity`` — the same function CoreSessionSink
+        uses on the audit path — so a resource the cycle scored is found here under
+        the identical id. The container is derived from the NORMALISED resource
+        locator, never from the raw path.
         """
         args = intent.payload.get("args", {})
         tool = intent.payload.get("tool", "")
 
-        resource_info = derive_resource_info(tool, args)
-        resource_id, _, _ = normalize_resource_id(resource_info)
-
-        # Container ID: service + directory of the resource
-        container_id = derive_container_id(
-            resource_info.get("path", ""),
-            resource_info.get("service", ""),
-        )
-        return resource_id, container_id
+        identity = derive_identity(tool, args)
+        if identity is None:
+            return None
+        return identity.resource_id, identity.container_id
