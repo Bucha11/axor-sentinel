@@ -37,7 +37,10 @@ class SlowAndLowReport:
               gap_days           — float, days between sessions
               flagged_resources  — list[str] of resource IDs
               scores             — list[float] of suspicion scores
-            Ordered by gap_days descending.
+            Ordered by gap_days descending. These are the real driver keys
+            (the query aliases every column). Sessions of agents with an
+            empty agent_id are never correlated — "" is "no identity", shared
+            by every anonymous session, not one agent.
         """
         min_gap_ms = min_gap_days * 86_400_000.0
         return queries.slow_and_low_detection(self._session, min_gap_ms=min_gap_ms)

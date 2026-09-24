@@ -6,11 +6,15 @@ control plane is not on that host: it renders the reputation a node's sentinel
 computed, so the snapshot travels, and what arrives was computed somewhere else
 entirely.
 
-That changes what the checksum is for. Between two processes on one host it
-catches a lost bit. Over a wire, a payload whose checksum does not match its own
-maps was rewritten by somebody, and the plane has no other way to tell.
+The checksum is an UNKEYED SHA-256 over the two reputation maps: it catches a
+lost bit or a naive edit of the maps, on disk or over a wire, but anyone who
+rewrites the maps can recompute it. It is corruption detection, not tamper
+protection — authenticity over a wire comes from the transport, and on disk from
+the HMAC signature (AXOR_SNAPSHOT_KEY), which covers the whole snapshot.
 """
 from __future__ import annotations
+
+import math
 
 import pytest
 
@@ -147,3 +151,111 @@ def test_an_unsigned_snapshot_is_accepted() -> None:
     plane does not hold and must not. Requiring one here would mean handing the
     reputation key to the party the reputation is reported TO."""
     assert snapshot_from_payload(snapshot_payload(_snapshot())).signature == ""
+
+
+# ── levels are bound to the checksummed suspicions ────────────────────────────
+
+
+def test_relabelling_a_flagged_resource_clean_is_refused() -> None:
+    """The checksum covers the suspicion maps, and a consumer renders and alerts
+    on the LEVELS. A payload that keeps `1.0` (so the checksum still matches)
+    but says CLEAN would clear a flagged resource on every screen and silence
+    its alert; the level must be the one its suspicion was derived from."""
+    payload = snapshot_payload(_snapshot())
+    payload["resource_level"]["db:customers"] = "CLEAN"
+    with pytest.raises(SnapshotRejected, match="contradicts"):
+        snapshot_from_payload(payload)
+
+
+def test_a_suspicion_with_no_level_is_refused() -> None:
+    payload = snapshot_payload(_snapshot())
+    del payload["resource_level"]["s3:exports"]
+    with pytest.raises(SnapshotRejected, match="has no level"):
+        snapshot_from_payload(payload)
+
+
+def test_a_snapshot_without_levels_still_arrives() -> None:
+    """A legacy snapshot that carries only suspicions has no level to contradict."""
+    legacy = _snapshot(resource_level={}, container_level={})
+    assert snapshot_from_payload(snapshot_payload(legacy)).resource_level == {}
+
+
+def test_lowercase_levels_arrive_canonical() -> None:
+    """Sentinel <0.4.2 wrote `flagged`; the wire refused it, so no real cycle's
+    snapshot could be reported. Either spelling is accepted and handed back in
+    the canonical one, which is what consumers compare against."""
+    payload = snapshot_payload(_snapshot(
+        resource_level={"db:customers": "flagged", "s3:exports": "watch"},
+        container_level={"svc:billing": "Watch"},
+    ))
+    arrived = snapshot_from_payload(payload)
+    assert arrived.resource_level == {"db:customers": "FLAGGED", "s3:exports": "WATCH"}
+    assert arrived.container_level == {"svc:billing": "WATCH"}
+
+
+# ── hardening: every bad payload is SnapshotRejected, never another error ────
+
+
+def _payload(**over: object) -> dict:
+    payload = snapshot_payload(_snapshot())
+    payload.update(over)
+    return payload
+
+
+@pytest.mark.parametrize("field_name", [
+    "resource_reputation", "container_reputation",
+    "resource_score_telemetry", "container_score_telemetry",
+])
+def test_an_unbounded_integer_is_rejected_not_overflowed(field_name: str) -> None:
+    """A JSON number is unbounded and `float(10**400)` raises OverflowError —
+    which escaped as the wrong exception type to a caller catching
+    SnapshotRejected."""
+    with pytest.raises(SnapshotRejected, match="out of range"):
+        snapshot_from_payload(_payload(**{field_name: {"r": 10**400}}))
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("field_name", [
+    "resource_reputation", "resource_score_telemetry", "container_score_telemetry",
+])
+def test_non_finite_numbers_are_rejected(field_name: str, bad: float) -> None:
+    with pytest.raises(SnapshotRejected, match="finite"):
+        snapshot_from_payload(_payload(**{field_name: {"r": bad}}))
+
+
+@pytest.mark.parametrize("bad", [
+    {"r": "0.4"},          # a string is not a number
+    {"r": True},           # nor is a bool
+    {1: 0.4},              # ids are strings
+    ["r", 0.4],            # not a map at all
+])
+def test_telemetry_must_map_ids_to_numbers(bad: object) -> None:
+    with pytest.raises(SnapshotRejected):
+        snapshot_from_payload(_payload(resource_score_telemetry=bad))
+
+
+def test_finite_telemetry_is_accepted_and_coerced() -> None:
+    arrived = snapshot_from_payload(_payload(resource_score_telemetry={"r": 3}))
+    assert arrived.resource_score_telemetry == {"r": 3.0}
+
+
+def test_a_negative_version_is_rejected() -> None:
+    with pytest.raises(SnapshotRejected, match="negative"):
+        snapshot_from_payload(_payload(version=-1))
+
+
+@pytest.mark.parametrize("bad", ["yesterday", None, True, math.nan, math.inf, 10**400])
+def test_generated_at_must_be_a_finite_number(bad: object) -> None:
+    with pytest.raises(SnapshotRejected, match="generated_at"):
+        snapshot_from_payload(_payload(generated_at=bad))
+
+
+@pytest.mark.parametrize("bad", [
+    ["P3"],                          # not a map
+    {"db:customers": "P3"},          # a string, not a list of facts
+    {"db:customers": [1, 2]},        # facts are strings
+    {1: ["P3"]},                     # ids are strings
+])
+def test_verdict_facts_must_map_ids_to_string_lists(bad: object) -> None:
+    with pytest.raises(SnapshotRejected, match="verdict_facts"):
+        snapshot_from_payload(_payload(verdict_facts=bad))

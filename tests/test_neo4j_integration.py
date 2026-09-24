@@ -116,6 +116,12 @@ _EXPLAIN_PARAMS = {
 }
 
 
+def test_schema_statements_are_accepted_and_idempotent(session) -> None:
+    # IF NOT EXISTS: running them twice (every SentinelCycle start) is a no-op.
+    assert construct.ensure_schema(session) is True
+    assert construct.ensure_schema(session) is True
+
+
 @pytest.mark.parametrize("name", list(_EXPLAIN_PARAMS))
 def test_query_parses_on_real_neo4j(session, name) -> None:
     # EXPLAIN parses + plans without executing; a SyntaxError here is a shipped bug.
@@ -189,6 +195,31 @@ class TestDecayQuery:
         )
         q.apply_decay(session, flag_threshold=FLAG_THRESHOLD)
         assert _score(session, "r_zero") == 0.0
+
+
+    def test_first_hit_after_long_idle_is_not_decayed_by_the_idle_time(
+        self, session,
+    ) -> None:
+        """A node created at 0 on day 0 and first hit on day 100 must not lose
+        100 days of decay on the next cycle: the hit restarts its decay clock."""
+        session.run(
+            """
+            CREATE (a:Agent {agent_id: 'ag'})-[:IN_SESSION]->
+                   (s:Session {session_id: 's_late', had_taint: true})
+            CREATE (r:Resource {id: 'r_idle', suspicion_score: 0.0,
+                                canonical_confidence: 1.0, flagged: false,
+                                last_decay_at: timestamp() - $age_ms,
+                                last_signal_at: timestamp() - $age_ms})
+            CREATE (s)-[:ACCESSED {signal_type: 'read_summarize'}]->(r)
+            """,
+            age_ms=100 * DAY_MS,
+        )
+        q.apply_hot_weight(
+            session, session_id="s_late", signal_type="read_summarize",
+            raw_weight=0.6, flag_threshold=FLAG_THRESHOLD, resource_id="r_idle",
+        )
+        q.apply_decay(session, flag_threshold=FLAG_THRESHOLD)
+        assert _score(session, "r_idle") == pytest.approx(0.6, abs=1e-3)
 
 
 # ── HOT_WEIGHT_QUERY ───────────────────────────────────────────────────────────
@@ -331,8 +362,29 @@ class TestSlowAndLowDetection:
 
         assert len(rows) == 1
         row = rows[0]
-        assert row["ag.agent_id"] == "ag_stage"
+        assert row["agent_id"] == "ag_stage"
         assert row["flagged_resources"] == ["r_stage"]
+
+    def test_blank_agent_id_is_never_correlated(self, session) -> None:
+        """Sessions without an agent identity all hang off Agent {agent_id:''};
+        they must not be correlated as one agent staging data."""
+        session.run(
+            """
+            CREATE (ag:Agent {agent_id: ''})
+            CREATE (s1:Session {session_id: 'x1', had_taint: true,
+                                had_export_attempt: false, started_at: 0})
+            CREATE (s2:Session {session_id: 'x2', had_taint: false,
+                                had_export_attempt: true, started_at: $gap})
+            CREATE (r:Resource {id: 'r_x', suspicion_score: 0.9, flagged: true,
+                                canonical_confidence: 1.0,
+                                last_decay_at: timestamp(), last_signal_at: timestamp()})
+            CREATE (ag)-[:IN_SESSION]->(s1)
+            CREATE (ag)-[:IN_SESSION]->(s2)
+            CREATE (s1)-[:ACCESSED]->(r)
+            """,
+            gap=10 * DAY_MS,
+        )
+        assert q.slow_and_low_detection(session, min_gap_ms=DAY_MS) == []
 
     def test_no_detection_when_gap_too_small(self, session) -> None:
         """Sessions closer than min_gap_ms must not be reported."""
@@ -410,6 +462,23 @@ class TestGraphConstruction:
         ).single()
         assert rec["c"] == pytest.approx(1.0)
 
+    def test_session_upsert_keeps_flags_and_earliest_start(self, session) -> None:
+        """A later, thinner record for the same session (e.g. the probe
+        bridge's minimal drift summary) must not clear flags or move
+        started_at forward."""
+        t0 = time.time() - 3600
+        full = _summary("s_u", "a1", [], started_at=t0,
+                        had_export_attempt=True, had_failed_export=True)
+        thin = _summary("s_u", "a1", [], started_at=t0 + 600, had_taint=False)
+        construct.upsert_graph(session, [full], {}, {}, flag_threshold=FLAG_THRESHOLD)
+        construct.upsert_graph(session, [thin], {}, {}, flag_threshold=FLAG_THRESHOLD)
+        rec = session.run(
+            "MATCH (s:Session {session_id:'s_u'}) RETURN s.had_taint AS t, "
+            "s.had_export_attempt AS e, s.had_failed_export AS f, s.started_at AS at"
+        ).single()
+        assert rec["t"] is True and rec["e"] is True and rec["f"] is True
+        assert rec["at"] == int(t0 * 1000)
+
     def test_adjacency_makes_caution_propagate(self, session) -> None:
         """A resource adjacent to a hot one (but not accessed) gets caution score."""
         # r_old exists from a prior session so it can be an un-accessed neighbour.
@@ -451,7 +520,7 @@ class TestGraphConstruction:
         assert _flagged(session, "r1") is True
         rows = q.slow_and_low_detection(session, min_gap_ms=DAY_MS)
         assert len(rows) == 1
-        assert rows[0]["ag.agent_id"] == "a1"
+        assert rows[0]["agent_id"] == "a1"
         assert rows[0]["flagged_resources"] == ["r1"]
 
 
@@ -475,7 +544,7 @@ class TestFullCycleSnapshot:
 
         assert snap.resource_score_telemetry["r1"] > 0.0
         assert snap.resource_score_telemetry["r1"] == pytest.approx(_score(session, "r1"))
-        assert snap.resource_level["r1"] == "watch"
+        assert snap.resource_level["r1"] == "WATCH"
         assert snap.resource_reputation["r1"] == pytest.approx(0.4)
 
     def test_untainted_session_leaves_score_at_zero(self, session, tmp_path) -> None:
@@ -507,7 +576,7 @@ class TestFullCycleSnapshot:
         # ...and the decidable verdicts diverge: a denied export FLAGS (P1),
         # a tainted plain READ stays CLEAN (absent from the wire map).
         assert snap_fail.resource_reputation["rr"] == pytest.approx(1.0)
-        assert snap_fail.resource_level["rr"] == "flagged"
+        assert snap_fail.resource_level["rr"] == "FLAGGED"
         assert "rr" not in snap_read.resource_reputation
 
     def test_container_scores_populated(self, session, tmp_path) -> None:
@@ -569,5 +638,5 @@ class TestFullCycleSnapshot:
         # Decidable layer: fanout floors the touched resource at WATCH and
         # names the fact.
         assert snap.resource_reputation["r0"] == pytest.approx(0.4)
-        assert snap.resource_level["r0"] == "watch"
+        assert snap.resource_level["r0"] == "WATCH"
         assert any(f.startswith("F1:fanout") for f in snap.verdict_facts["r0"])

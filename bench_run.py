@@ -24,6 +24,7 @@ from axor_sentinel.sentinel.predicates import (
     ReputationLevel,
     SentinelPolicy,
     evaluate_resource,
+    fanout_containers,
     fanout_exceeded,
 )
 from axor_sentinel.sentinel.weight import (
@@ -52,7 +53,11 @@ def level_scenario(scenario: Scenario, policy: SentinelPolicy) -> bool:
                  if a.signal_type in SignalType._value2member_map_]
         if fanout_exceeded(
             True,
-            (a.container_id for a in session.accessed_resources),
+            fanout_containers(
+                (a.container_id, SignalType(a.signal_type))
+                for a in session.accessed_resources
+                if a.signal_type in SignalType._value2member_map_
+            ),
             max(ranks) if ranks else None,
             policy,
             source_class=scenario.agent_profile,

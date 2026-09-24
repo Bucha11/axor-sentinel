@@ -4,9 +4,8 @@ import logging
 from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
-from axor_sentinel.graph.derive import derive_container_id, derive_resource_info
+from axor_sentinel.graph.derive import derive_identity, tool_tokens
 from axor_sentinel.graph.model import SignalType
-from axor_sentinel.graph.normalizer import normalize_resource_id
 from axor_sentinel.sentinel.cycle import ResourceAccess, SessionSummary
 
 
@@ -41,19 +40,21 @@ class CoreSessionRecord(Protocol):
 
 log = logging.getLogger("axor.sentinel.core_sink")
 
-# Tool-name substrings that indicate an export / exfiltration-shaped action.
+# Tool-name VERB tokens that indicate an export / exfiltration-shaped action.
 # Coarse, name-only heuristic — the audit cycle (not the hot path) consumes this,
-# so a best-effort signal is acceptable.
-_EXPORT_TOOL_TOKENS: tuple[str, ...] = (
-    "export", "send", "upload", "email", "post",
+# so a best-effort signal is acceptable. Matched against whole name tokens
+# (``graph.derive.tool_tokens``), not substrings: "post" in ``postgres_query`` and
+# "email" in ``read_email`` used to mark plain reads as exports. "email" is not a
+# verb and is deliberately absent — ``send_email`` still matches on "send".
+_EXPORT_TOOL_TOKENS: frozenset[str] = frozenset({
+    "export", "send", "upload", "post",
     "write", "commit", "push", "share",
-)
+})
 
 
 def _is_export_tool(tool: str) -> bool:
     """True if the tool name looks like an export / outbound action."""
-    t = (tool or "").lower()
-    return any(token in t for token in _EXPORT_TOOL_TOKENS)
+    return not _EXPORT_TOOL_TOKENS.isdisjoint(tool_tokens(tool))
 
 
 class CoreSessionSink:
@@ -137,8 +138,13 @@ class CoreSessionSink:
         # when a denial is for a non-export intent — documented best-effort signal.
         had_failed_export = had_export_attempt and ("intent_denied" in event_kinds)
 
+        # A path-less call (bash, send_email {"to": …}) names no resource and
+        # records no access: "" as a resource id would be one node shared by every
+        # such call everywhere. The session-level export flags above still see it.
         accessed_resources = [
-            self._map_access(inv, event_kinds) for inv in invocations
+            access
+            for access in (self._map_access(inv, event_kinds) for inv in invocations)
+            if access is not None
         ]
 
         return SessionSummary(
@@ -154,14 +160,14 @@ class CoreSessionSink:
             source_class=getattr(record, "source_class", "") or "",
         )
 
-    def _map_access(self, inv, event_kinds: tuple[str, ...]) -> ResourceAccess:
+    def _map_access(self, inv, event_kinds: tuple[str, ...]) -> ResourceAccess | None:
         """
-        Map one ``ToolInvocationRecord`` to a graded ``ResourceAccess``.
+        Map one ``ToolInvocationRecord`` to a graded ``ResourceAccess``, or ``None``
+        when the call names no resource.
 
-        Resource identity is derived with the same arg-key extraction the
-        SnapshotIntentEnricher uses (``derive_resource_info`` →
-        ``normalize_resource_id``) so IDs are consistent across the hot path and
-        the audit path.
+        Resource and container identity come from ``graph.derive.derive_identity``
+        — the very function the SnapshotIntentEnricher calls — so IDs are identical
+        across the hot path and the audit path by construction.
 
         SignalType grading (using real members of graph.model.SignalType):
           * non-export tool                      -> READ                  (0.4)
@@ -169,12 +175,9 @@ class CoreSessionSink:
           * export-shaped tool, not executed,
             or session saw a denial              -> READ_EXPORT_FAILED    (1.0)
         """
-        resource_info = derive_resource_info(inv.tool, inv.args)
-        resource_id, _method, confidence = normalize_resource_id(resource_info)
-        container_id = derive_container_id(
-            resource_info.get("path", ""),
-            resource_info.get("service", ""),
-        )
+        identity = derive_identity(inv.tool, inv.args)
+        if identity is None:
+            return None
 
         if _is_export_tool(inv.tool):
             if not inv.executed or ("intent_denied" in event_kinds):
@@ -185,9 +188,9 @@ class CoreSessionSink:
             signal_type = SignalType.READ
 
         return ResourceAccess(
-            resource_id=resource_id,
-            container_id=container_id,
-            canonical_confidence=confidence,
+            resource_id=identity.resource_id,
+            container_id=identity.container_id,
+            canonical_confidence=identity.confidence,
             signal_type=signal_type,
         )
 
