@@ -31,7 +31,13 @@ log = logging.getLogger("axor.sentinel.compat")
 # 0.11.0: 199 tests pass and the only failure was this bound refusing the
 # version it was running on.
 MIN_AXOR_CORE = (0, 7, 0)
-MAX_AXOR_CORE = (0, 12, 0)
+# 0.12.x validated: its breaking changes are STRICT-only (record closure, a
+# required consumption ground per guarded sink) and this package constructs no
+# governor at all. The two surfaces it touches, `contracts.anomaly.NormalizedIntent`
+# and `contracts.intent.Intent`, are unchanged. Measured against an installed
+# 0.12.0: 427 tests pass and the only failure was this bound refusing the
+# version it was running on.
+MAX_AXOR_CORE = (0, 13, 0)
 
 
 def _parse(version: str) -> tuple[int, int, int]:
