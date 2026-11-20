@@ -37,7 +37,10 @@ MIN_AXOR_CORE = (0, 7, 0)
 # and `contracts.intent.Intent`, are unchanged. Measured against an installed
 # 0.12.0: 427 tests pass and the only failure was this bound refusing the
 # version it was running on.
-MAX_AXOR_CORE = (0, 13, 0)
+# 0.13.x validated: a replay fix, a ledger fix and a new integrity signal (code
+# fetched by name); neither surface above moved. Measured against an installed
+# 0.13.0: 427 tests pass and the only failure was this bound refusing it.
+MAX_AXOR_CORE = (0, 14, 0)
 
 
 def _parse(version: str) -> tuple[int, int, int]:
