@@ -106,6 +106,38 @@ degradation = DegradationEngine(detection_floor=1.0 - FLAG_THRESHOLD)
 loop = IntentLoop(..., reputation_enricher=enricher, degradation_engine=degradation)
 ```
 
+## Reporting to the Control Plane
+
+The plane's "data across sessions" view (and the agent's panel) renders a node's
+`ReputationSnapshot` as `sentinel.snapshot.snapshot_payload(snapshot)`, posted
+under the agent's node id. This package does not talk to the plane; the agent's
+plane link does, and that link is axor-wrap's:
+
+```python
+from axor_sentinel.sentinel.snapshot import snapshot_payload
+
+snapshot = cycle.run_once(sessions)          # the quick start above
+await connector.post_reputation(snapshot_payload(snapshot))   # axor_wrap PlaneConnector
+```
+
+It lands as `POST /v1/plane/{node_id}/reputation`. The plane refuses a version
+it already holds, so post each new snapshot once.
+
+A runtime that owns its loop (axor-langchain, axor-claude, or your own loop
+recorded with `axor_wrap.observe.RunRecorder`) does not need Neo4j for this:
+`axor_wrap.observe.ReputationBook` folds each finished run through this
+package's `CoreSessionSink` and verdict layer (evidence → predicates — what
+decides levels and facts; the graph only adds telemetry scores) and returns the
+snapshot payload to post.
+
+**What reputation needs.** Evidence comes from finished sessions — the agent's
+own loop, with its taint state — and resources are what a call names: a path or
+a URL ([Resource ids](#resource-ids)). An agent governed only by the guard proxy
+is seen one tool call at a time and its sessions are not recorded here, so it has
+no reputation; wrap it in code. A call that names no resource (an API taking a
+`ticket_id`) records no access: give such tools a URL-shaped argument, or a
+resource id, if their data should be tracked.
+
 ## Bench suite
 
 820-scenario synthetic dataset (paper baseline):
